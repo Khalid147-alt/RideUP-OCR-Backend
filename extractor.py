@@ -6,7 +6,16 @@ status codes or FastAPI. It exposes a small, testable surface:
 - ``encode_image``           — bytes → base64 string
 - ``detect_image_quality``   — quick sanity check before calling the API
 - ``calculate_confidence``   — server-side confidence override
+- ``sanitize_model_output``  — strip fences/whitespace, isolate JSON body
 - ``extract_from_image``     — full pipeline, returns ``ExtractionResult``
+
+Resilience:
+
+- API calls are wrapped in exponential backoff (1s → 2s → 4s, max 3 retries)
+  that targets transient upstream failures (429 / 502 / 503 / timeouts).
+- Model output is aggressively sanitized before parsing. If JSON parsing
+  still fails after the configured number of attempts, a low-confidence
+  result is returned with an explanatory ``notes`` entry rather than raising.
 """
 
 from __future__ import annotations
@@ -15,10 +24,20 @@ import base64
 import io
 import json
 import logging
-from typing import Any, Literal
+import random
+import re
+import time
+from typing import Any, Callable, Literal
 
 import google.generativeai as genai
-from google.api_core.exceptions import GoogleAPIError
+from google.api_core.exceptions import (
+    DeadlineExceeded,
+    GoogleAPIError,
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
+    TooManyRequests,
+)
 from PIL import Image, UnidentifiedImageError
 
 from config import settings
@@ -37,6 +56,22 @@ _MIN_FILE_SIZE_BYTES = 10 * 1024  # 10 KB
 # Gemini call parameters.
 _MAX_OUTPUT_TOKENS = 500
 _TEMPERATURE = 0.0
+
+# Backoff: max attempts and base delays (seconds). The Nth retry sleeps
+# ``_BACKOFF_DELAYS[N-1]`` plus a small jitter.
+_MAX_API_ATTEMPTS = 3
+_BACKOFF_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+_BACKOFF_JITTER_SECONDS = 0.25
+
+# Transient errors worth retrying. ``GoogleAPIError`` subclasses cover the
+# 429 / 502 / 503 / deadline-exceeded surface.
+_RETRYABLE_API_ERRORS: tuple[type[Exception], ...] = (
+    TooManyRequests,        # 429
+    ResourceExhausted,      # 429 quota
+    InternalServerError,    # 500
+    ServiceUnavailable,     # 503
+    DeadlineExceeded,       # 504 / timeouts
+)
 
 
 ImageQuality = Literal["good", "poor"]
@@ -134,6 +169,81 @@ def calculate_confidence(result: dict[str, Any]) -> Literal["high", "medium", "l
 
 
 # ---------------------------------------------------------------------------
+# JSON sanitization
+# ---------------------------------------------------------------------------
+
+# Matches an opening ```...``` fence, optionally with a language tag, anywhere
+# at the start of the text. We strip the whole fenced wrapper in one pass.
+_FENCE_OPEN_RE = re.compile(r"^\s*```[a-zA-Z0-9_+\-]*\s*\n?")
+_FENCE_CLOSE_RE = re.compile(r"\n?\s*```\s*$")
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove ``` and ```json fences (open + close) from a text block."""
+    stripped = text.strip()
+    stripped = _FENCE_OPEN_RE.sub("", stripped, count=1)
+    stripped = _FENCE_CLOSE_RE.sub("", stripped, count=1)
+    return stripped.strip()
+
+
+def sanitize_model_output(raw: str) -> str:
+    """Aggressively clean a model response so it parses as JSON.
+
+    Steps applied in order:
+
+    1. Strip leading/trailing whitespace.
+    2. Strip ```/```json markdown fences (both open and close).
+    3. Strip any text before the first ``{`` and after the last ``}``.
+    4. If the JSON is missing a final ``}`` (truncated output), append one.
+
+    Args:
+        raw: Raw text from the vision model.
+
+    Returns:
+        A best-effort JSON-looking string. The caller still has to call
+        ``json.loads`` and handle failure.
+    """
+    if not raw:
+        return ""
+
+    cleaned = _strip_json_fences(raw)
+    if not cleaned:
+        return ""
+
+    # Trim anything before the first '{' / after the last '}'. This handles
+    # leading prose like "Sure! Here's the data:" that some models emit.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1:
+        return ""
+    if end == -1 or end < start:
+        # Open brace but no close — probably truncated. Take from start to end
+        # of string and append a closing brace.
+        cleaned = cleaned[start:].rstrip() + "}"
+    else:
+        cleaned = cleaned[start : end + 1]
+
+    return cleaned.strip()
+
+
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    """Parse the model output as JSON, raising ``ValueError`` on failure.
+
+    Sanitization is applied unconditionally. The exception message preserves
+    the underlying ``json.JSONDecodeError`` detail for log analysis.
+    """
+    cleaned = sanitize_model_output(raw)
+    if not cleaned:
+        raise ValueError("Empty model response.")
+    if not cleaned.startswith("{"):
+        raise ValueError("No JSON object found in model response.")
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON decode failed: {exc.msg} at pos {exc.pos}") from exc
+
+
+# ---------------------------------------------------------------------------
 # Gemini client
 # ---------------------------------------------------------------------------
 
@@ -158,15 +268,74 @@ def _ensure_client_configured() -> None:
     _client_configured = True
 
 
-def _strip_json_fences(text: str) -> str:
-    """Remove ```json ... ``` fences if the model emitted any."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        # Remove opening fence (``` or ```json) and trailing fence.
-        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-    return stripped.strip()
+def _sleep_backoff(attempt_index: int) -> None:
+    """Sleep with the backoff delay for the given (1-based) retry attempt.
+
+    The first retry waits ~1s, the second ~2s, the third ~4s. A small random
+    jitter is added so concurrent callers do not all hammer the API at the
+    same instant.
+    """
+    base = _BACKOFF_DELAYS[min(attempt_index - 1, len(_BACKOFF_DELAYS) - 1)]
+    jitter = random.uniform(0.0, _BACKOFF_JITTER_SECONDS)
+    time.sleep(base + jitter)
+
+
+def _with_api_retries(
+    operation_name: str,
+    func: Callable[[], str],
+) -> str:
+    """Run ``func`` with exponential backoff on transient Gemini failures.
+
+    Args:
+        operation_name: Short label for logging (e.g. "extract", "retry").
+        func: Zero-arg callable that performs a single Gemini API call and
+            returns its text response.
+
+    Returns:
+        The successful response text.
+
+    Raises:
+        GoogleAPIError: re-raised if the final attempt also fails.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, _MAX_API_ATTEMPTS + 1):
+        try:
+            return func()
+        except _RETRYABLE_API_ERRORS as exc:
+            last_exc = exc
+            if attempt >= _MAX_API_ATTEMPTS:
+                logger.error(
+                    "Gemini API call '%s' failed after %d attempts: %s",
+                    operation_name,
+                    attempt,
+                    exc,
+                )
+                raise
+            delay = _BACKOFF_DELAYS[min(attempt - 1, len(_BACKOFF_DELAYS) - 1)]
+            logger.warning(
+                "Gemini API call '%s' attempt %d/%d failed with %s; "
+                "retrying in ~%.1fs",
+                operation_name,
+                attempt,
+                _MAX_API_ATTEMPTS,
+                type(exc).__name__,
+                delay,
+            )
+            _sleep_backoff(attempt)
+        except GoogleAPIError as exc:
+            # Non-retryable Google API error (4xx other than 429) — bail out.
+            logger.error(
+                "Gemini API call '%s' failed with non-retryable error: %s",
+                operation_name,
+                exc,
+            )
+            raise
+
+    # Defensive — should be unreachable.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unreachable: retry loop exited without result.")
 
 
 def _call_vision_model(
@@ -175,6 +344,9 @@ def _call_vision_model(
     mime_type: str,
 ) -> str:
     """Send the prompt + image to Gemini and return the raw text response.
+
+    This is the *single-attempt* call. Retries are layered on by
+    ``_with_api_retries``.
 
     Args:
         prompt: The full user-side prompt.
@@ -200,9 +372,6 @@ def _call_vision_model(
             prompt,
         ]
     )
-    # ``response.text`` aggregates all candidate text parts. If the model
-    # returned no text (e.g. safety block), surface an empty string and let
-    # the JSON parser raise downstream.
     try:
         return response.text or ""
     except (ValueError, AttributeError):
@@ -210,19 +379,67 @@ def _call_vision_model(
         return ""
 
 
-def _parse_json_response(raw: str) -> dict[str, Any]:
-    """Parse a JSON object from the model output, raising ``ValueError`` on failure."""
-    cleaned = _strip_json_fences(raw)
-    if not cleaned:
-        raise ValueError("Empty model response.")
-    # Some models occasionally emit leading text — try to locate the first {.
-    if not cleaned.startswith("{"):
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("No JSON object found in model response.")
-        cleaned = cleaned[start : end + 1]
-    return json.loads(cleaned)
+# ---------------------------------------------------------------------------
+# Platform routing
+# ---------------------------------------------------------------------------
+
+
+def _select_prompt(image_bytes: bytes, hint: str | None) -> str:
+    """Choose the best prompt variant for this image.
+
+    Routing priority:
+
+    1. An explicit ``deliveroo`` hint always wins — the caller knows best.
+    2. If the image looks like Deliveroo by colour signature (teal-dominant),
+       use the Deliveroo prompt.
+    3. Otherwise, use the master prompt (optionally augmented with the hint).
+    """
+    hint_clean = (hint or "").strip().lower()
+    if hint_clean == "deliveroo":
+        logger.info("Routing to Deliveroo prompt (explicit hint).")
+        return build_extraction_prompt("deliveroo")
+
+    if _looks_like_deliveroo(image_bytes):
+        logger.info("Routing to Deliveroo prompt (teal colour signature detected).")
+        return build_extraction_prompt("deliveroo")
+
+    return build_extraction_prompt(hint_clean or None)
+
+
+def _looks_like_deliveroo(image_bytes: bytes) -> bool:
+    """Cheap colour-signature check for Deliveroo's teal/cyan UI.
+
+    Returns True if a meaningful proportion of pixels fall in the teal/cyan
+    hue range. The check is intentionally conservative — false positives are
+    harmless (the Deliveroo prompt also self-classifies platform), but false
+    negatives just fall back to the master prompt.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            small = img.convert("RGB").resize((64, 64))
+    except (UnidentifiedImageError, OSError, ValueError):
+        return False
+
+    teal_pixels = 0
+    total = 0
+    for r, g, b in small.getdata():
+        total += 1
+        # Teal/cyan: green and blue both substantially higher than red.
+        if g > 100 and b > 100 and g + b > 2 * r + 60 and abs(g - b) < 80:
+            teal_pixels += 1
+
+    if total == 0:
+        return False
+    ratio = teal_pixels / total
+    if ratio >= 0.06:  # ~6% of the image — generous but specific to teal UIs
+        logger.debug("Teal pixel ratio: %.3f (Deliveroo signature)", ratio)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Result coercion
+# ---------------------------------------------------------------------------
 
 
 def _coerce_result(parsed: dict[str, Any], raw_text_fallback: str) -> ExtractionResult:
@@ -274,6 +491,26 @@ def _coerce_result(parsed: dict[str, Any], raw_text_fallback: str) -> Extraction
     )
 
 
+def _low_confidence_failure(
+    raw_response: str,
+    errors: list[str],
+) -> ExtractionResult:
+    """Return a placeholder result describing why parsing failed."""
+    notes = "Model response could not be parsed as JSON after all retries. "
+    notes += " ".join(errors)
+    return ExtractionResult(
+        pay=None,
+        currency="unknown",
+        miles=None,
+        minutes=None,
+        orders=None,
+        platform="unknown",
+        confidence="low",
+        notes=notes.strip(),
+        raw_text=raw_response[:1000],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -289,11 +526,12 @@ def extract_from_image(
 
     1. Detects image quality. Poor-quality images still go to the model but
        the result is flagged in ``notes`` and confidence is capped at "low".
-    2. Calls Gemini Vision with the master prompt.
-    3. Parses the JSON response. On failure, retries once with a stricter
-       prompt.
-    4. Coerces the parsed dict into an ``ExtractionResult`` and re-computes
-       confidence server-side.
+    2. Selects the best prompt variant (master vs Deliveroo-specific).
+    3. Calls Gemini Vision with exponential backoff retries on 429/502/503.
+    4. Sanitizes the response and parses it as JSON. On failure, retries
+       once with a stricter prompt (also with backoff).
+    5. If JSON parsing still fails, returns a low-confidence placeholder
+       rather than raising.
 
     Args:
         image_bytes: Raw image bytes (already validated for size/type by the
@@ -305,61 +543,50 @@ def extract_from_image(
 
     Raises:
         RuntimeError: when the Gemini API key is missing.
-        GoogleAPIError: when the Gemini API call fails irrecoverably.
+        GoogleAPIError: when the Gemini API call fails irrecoverably (after
+            exhausting retries on transient errors).
     """
     quality = detect_image_quality(image_bytes)
     mime_type = _detect_mime_type(image_bytes)
-    prompt = build_extraction_prompt(hint)
+    prompt = _select_prompt(image_bytes, hint)
 
+    parse_errors: list[str] = []
     raw_response: str = ""
     parsed: dict[str, Any] | None = None
-    parse_error: str | None = None
 
-    try:
-        raw_response = _call_vision_model(prompt, image_bytes, mime_type)
-    except GoogleAPIError as exc:
-        logger.exception("Gemini API error during initial call: %s", exc)
-        raise
-
+    # --- First attempt: master/Deliveroo prompt, with backoff retries ----
+    raw_response = _with_api_retries(
+        "extract",
+        lambda: _call_vision_model(prompt, image_bytes, mime_type),
+    )
     try:
         parsed = _parse_json_response(raw_response)
-    except (ValueError, json.JSONDecodeError) as exc:
-        parse_error = str(exc)
+    except ValueError as exc:
+        parse_errors.append(f"Initial parse: {exc}.")
         logger.warning(
             "Initial JSON parse failed (%s); retrying with strict prompt.", exc
         )
 
+    # --- Retry attempt: stricter prompt, with backoff retries ----
     if parsed is None:
-        # One retry with a stricter prompt — covers the rare case where the
-        # model wrapped JSON in prose despite the instructions.
         try:
-            raw_response = _call_vision_model(
-                RETRY_STRICT_PROMPT, image_bytes, mime_type
+            raw_response = _with_api_retries(
+                "extract-retry",
+                lambda: _call_vision_model(RETRY_STRICT_PROMPT, image_bytes, mime_type),
             )
-            parsed = _parse_json_response(raw_response)
         except GoogleAPIError as exc:
-            logger.exception("Gemini API error during retry: %s", exc)
+            logger.exception("Gemini API error during strict-prompt retry: %s", exc)
             raise
-        except (ValueError, json.JSONDecodeError) as exc:
-            logger.error("Retry JSON parse also failed: %s", exc)
-            # Build a low-confidence empty result instead of raising.
-            notes_bits = [
-                "Model response could not be parsed as JSON after one retry.",
-            ]
-            if parse_error:
-                notes_bits.append(f"First error: {parse_error}.")
-            notes_bits.append(f"Retry error: {exc}.")
-            return ExtractionResult(
-                pay=None,
-                currency="unknown",
-                miles=None,
-                minutes=None,
-                orders=None,
-                platform="unknown",
-                confidence="low",
-                notes=" ".join(notes_bits),
-                raw_text=raw_response[:1000],
+
+        try:
+            parsed = _parse_json_response(raw_response)
+        except ValueError as exc:
+            parse_errors.append(f"Retry parse: {exc}.")
+            logger.error(
+                "Retry JSON parse also failed (%s); returning low-confidence result.",
+                exc,
             )
+            return _low_confidence_failure(raw_response, parse_errors)
 
     result = _coerce_result(parsed, raw_text_fallback=raw_response[:1000])
 

@@ -3,11 +3,15 @@
 The master prompt is tuned for UK gig-economy delivery screenshots — dark mode
 UIs, GBP £ amounts, batched multi-stop offers, partially visible elements, and
 low-contrast green/white-on-black colour schemes.
+
+Platform-specific prompt variants exist for the trickiest UIs (Deliveroo)
+where the master prompt alone misclassifies fields. Routing happens in
+``extractor._select_prompt``.
 """
 
 from __future__ import annotations
 
-# Strict JSON schema reproduced verbatim in the prompt so GPT-4o cannot drift.
+# Strict JSON schema reproduced verbatim in the prompt so the model cannot drift.
 EXPECTED_SCHEMA_EXAMPLE = """{
   "pay": 8.42,
   "currency": "GBP",
@@ -76,18 +80,93 @@ Return ONLY the JSON object — no markdown, no fences, no commentary.
 """
 
 
+# ---------------------------------------------------------------------------
+# Deliveroo-specific prompt
+# ---------------------------------------------------------------------------
+#
+# Deliveroo's UI has several quirks the master prompt doesn't always handle:
+#
+# - Teal/cyan accents (not green like Uber). Pay buttons and earnings banners
+#   are typically on a teal/turquoise background or with teal text.
+# - Pay format: often "£X.XX" but sometimes "£X.XX (Includes £Y.YY tip)" —
+#   we want the gross figure (the larger one shown to the rider) into ``pay``.
+# - "Single" vs "Stacked" orders:
+#     * Single  → one pickup card, one drop card, often "1 delivery" implied.
+#     * Stacked → two or more pickup/drop cards with a "Multi-order" or
+#                 "Stacked" badge near the top.
+# - Distance/time appear as "X mi · X min" or as two separate chips rather
+#   than the "X min (X mi) total" Uber phrasing.
+# - "Standard / Plus / Priority" labels are NOT order counts — ignore them.
+
+DELIVEROO_EXTRACTION_PROMPT = f"""You are an expert data extractor for **Deliveroo** rider/courier screenshots in the UK.
+The screenshot is from the Deliveroo Rider app. Read it and emit ONE valid
+JSON object — no markdown, no fences, no prose.
+
+# Deliveroo visual cues you can rely on
+- Teal / cyan / turquoise accents (the Deliveroo brand colour).
+- Dark navy or black background, white text.
+- Rounded rider/restaurant cards.
+- A bold £ amount near the top of an offer or earnings panel.
+- Pickup pin + drop pin icons; map snippet often present.
+
+# Deliveroo-specific extraction rules
+1. **Pay**:
+   - The headline £ amount is the gross pay. Use that for ``pay``.
+   - If a breakdown like "£6.20 (Includes £1.00 tip)" is shown, still use the
+     gross headline figure (£6.20) and mention the tip in ``notes``.
+   - If only a fee + tip are listed separately, sum them.
+
+2. **Orders (single vs stacked)**:
+   - Look for words like "Stacked", "Multi-order", "2 orders", or two
+     separate restaurant cards stacked vertically → orders >= 2.
+   - "Standard", "Plus", "Priority", "Rider+" are SUBSCRIPTION/TIER labels,
+     NOT order counts. Ignore them when counting.
+   - One restaurant card + one customer drop = single delivery → orders = 1.
+   - If you genuinely cannot tell, set orders to null.
+
+3. **Distance/time format**:
+   - Common Deliveroo layouts:
+     "2.1 mi · 18 min"   → miles 2.1, minutes 18
+     "18 min  ·  2.1 mi" → same
+     Two separate chips, one with distance, one with time → combine.
+   - If distance is in km ("3.4 km"), convert to miles (1 km = 0.621371 mi)
+     and mention the conversion in ``notes``.
+
+4. **Currency**: "£" → "GBP". Always.
+
+5. **Platform**: this screenshot IS Deliveroo. Set ``platform`` = "deliveroo".
+
+# Output schema (exact shape, no extra keys)
+{EXPECTED_SCHEMA_EXAMPLE.replace('"uber_eats"', '"deliveroo"')}
+
+Set any field you cannot read clearly to null (use "unknown" only for
+``currency`` and ``platform``). Put ambiguities in ``notes``.
+
+Emit the JSON object now. ONLY the JSON. No fences. No commentary.
+"""
+
+
 def build_extraction_prompt(hint: str | None = None) -> str:
     """Return the master extraction prompt, optionally augmented with a hint.
 
+    For ``hint == "deliveroo"`` the dedicated Deliveroo prompt is returned
+    instead of the master prompt — it handles the platform's quirks better.
+
     Args:
-        hint: Optional caller-supplied platform hint, e.g. ``"uber_eats"``.
+        hint: Optional caller-supplied platform hint, e.g. ``"uber_eats"`` or
+            ``"deliveroo"``.
 
     Returns:
-        The full prompt string to send as the user message to GPT-4o.
+        The full prompt string to send as the user message to the vision model.
     """
-    if not hint:
+    hint_clean = (hint or "").strip().lower()[:64]
+
+    if hint_clean == "deliveroo":
+        return DELIVEROO_EXTRACTION_PROMPT
+
+    if not hint_clean:
         return MASTER_EXTRACTION_PROMPT
-    hint_clean = hint.strip().lower()[:64]
+
     return (
         f"{MASTER_EXTRACTION_PROMPT}\n\n"
         f"# Caller hint\nThe caller suggests this screenshot is from: "

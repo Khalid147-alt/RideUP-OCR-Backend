@@ -1,0 +1,235 @@
+"""Tests for the three resilience features added in the latest pass:
+
+1. Deliveroo-specific prompt routing
+2. Exponential-backoff retries on 429 / 502 / 503
+3. JSON sanitization (fences, prose, partial output)
+"""
+
+from __future__ import annotations
+
+import io
+import json
+from unittest.mock import patch
+
+import pytest
+from google.api_core.exceptions import (
+    InternalServerError,
+    ServiceUnavailable,
+    TooManyRequests,
+)
+from PIL import Image
+
+import extractor
+import prompts
+from extractor import (
+    _looks_like_deliveroo,
+    _select_prompt,
+    _with_api_retries,
+    sanitize_model_output,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _teal_png(width: int = 600, height: int = 600) -> bytes:
+    """Solid teal image — should trigger Deliveroo detection."""
+    img = Image.new("RGB", (width, height), color=(0, 180, 170))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _black_png(width: int = 600, height: int = 600) -> bytes:
+    """Solid dark image — should NOT trigger Deliveroo detection."""
+    img = Image.new("RGB", (width, height), color=(10, 10, 10))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# 1. Deliveroo routing
+# ---------------------------------------------------------------------------
+
+
+def test_deliveroo_hint_routes_to_deliveroo_prompt() -> None:
+    """An explicit ``deliveroo`` hint always selects the Deliveroo prompt."""
+    chosen = _select_prompt(_black_png(), hint="deliveroo")
+    assert chosen == prompts.DELIVEROO_EXTRACTION_PROMPT
+
+
+def test_teal_image_routes_to_deliveroo_prompt() -> None:
+    """A teal-dominated image triggers the Deliveroo prompt automatically."""
+    chosen = _select_prompt(_teal_png(), hint=None)
+    assert chosen == prompts.DELIVEROO_EXTRACTION_PROMPT
+
+
+def test_non_teal_image_uses_master_prompt() -> None:
+    """A non-teal image with no hint falls through to the master prompt."""
+    chosen = _select_prompt(_black_png(), hint=None)
+    assert chosen == prompts.MASTER_EXTRACTION_PROMPT
+
+
+def test_uber_hint_does_not_use_deliveroo_prompt() -> None:
+    """A non-Deliveroo hint preserves the master prompt with the hint appended."""
+    chosen = _select_prompt(_black_png(), hint="uber_eats")
+    assert chosen != prompts.DELIVEROO_EXTRACTION_PROMPT
+    assert "uber_eats" in chosen.lower()
+
+
+def test_looks_like_deliveroo_positive() -> None:
+    assert _looks_like_deliveroo(_teal_png()) is True
+
+
+def test_looks_like_deliveroo_negative() -> None:
+    assert _looks_like_deliveroo(_black_png()) is False
+
+
+def test_deliveroo_prompt_mentions_teal_and_stacked() -> None:
+    """Sanity check the Deliveroo prompt contains its platform-specific cues."""
+    text = prompts.DELIVEROO_EXTRACTION_PROMPT.lower()
+    assert "teal" in text
+    assert "stacked" in text
+    assert "deliveroo" in text
+
+
+# ---------------------------------------------------------------------------
+# 2. Exponential backoff
+# ---------------------------------------------------------------------------
+
+
+def test_backoff_succeeds_after_two_transient_failures() -> None:
+    """A 503 then a 429 then success should still return the success body."""
+    calls = {"n": 0}
+
+    def _fake_call() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ServiceUnavailable("503 unavailable")
+        if calls["n"] == 2:
+            raise TooManyRequests("429 rate limit")
+        return '{"pay": 1.23}'
+
+    with patch.object(extractor.time, "sleep") as fake_sleep:
+        result = _with_api_retries("test", _fake_call)
+
+    assert result == '{"pay": 1.23}'
+    assert calls["n"] == 3
+    # Should have slept twice (after attempt 1 and attempt 2).
+    assert fake_sleep.call_count == 2
+
+
+def test_backoff_gives_up_after_three_attempts() -> None:
+    """After the configured max attempts, the last exception propagates."""
+    calls = {"n": 0}
+
+    def _always_503() -> str:
+        calls["n"] += 1
+        raise ServiceUnavailable("503 always")
+
+    with patch.object(extractor.time, "sleep"):
+        with pytest.raises(ServiceUnavailable):
+            _with_api_retries("test", _always_503)
+
+    assert calls["n"] == 3  # _MAX_API_ATTEMPTS
+
+
+def test_backoff_does_not_retry_non_transient_errors() -> None:
+    """A non-retryable GoogleAPIError aborts immediately."""
+    from google.api_core.exceptions import InvalidArgument
+
+    calls = {"n": 0}
+
+    def _bad_request() -> str:
+        calls["n"] += 1
+        raise InvalidArgument("400 bad request")
+
+    with patch.object(extractor.time, "sleep"):
+        with pytest.raises(InvalidArgument):
+            _with_api_retries("test", _bad_request)
+
+    assert calls["n"] == 1
+
+
+def test_backoff_delays_follow_1_2_4_pattern() -> None:
+    """The first sleep is ~1s, the second is ~2s (within jitter)."""
+    calls = {"n": 0}
+    delays: list[float] = []
+
+    def _fake_call() -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise InternalServerError("500")
+        return "{}"
+
+    def _capture_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    with patch.object(extractor.time, "sleep", side_effect=_capture_sleep):
+        _with_api_retries("test", _fake_call)
+
+    assert len(delays) == 2
+    # First retry: base 1.0 + jitter [0, 0.25]
+    assert 1.0 <= delays[0] <= 1.30
+    # Second retry: base 2.0 + jitter
+    assert 2.0 <= delays[1] <= 2.30
+
+
+# ---------------------------------------------------------------------------
+# 3. JSON sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_strips_json_fence() -> None:
+    raw = '```json\n{"pay": 5}\n```'
+    assert sanitize_model_output(raw) == '{"pay": 5}'
+
+
+def test_sanitize_strips_plain_fence() -> None:
+    raw = '```\n{"pay": 5}\n```'
+    assert sanitize_model_output(raw) == '{"pay": 5}'
+
+
+def test_sanitize_strips_leading_prose() -> None:
+    raw = 'Sure! Here is the data:\n{"pay": 5, "currency": "GBP"}\nHope this helps!'
+    cleaned = sanitize_model_output(raw)
+    assert cleaned.startswith("{") and cleaned.endswith("}")
+    assert json.loads(cleaned)["pay"] == 5
+
+
+def test_sanitize_handles_truncated_json() -> None:
+    """A response missing the closing brace gets one appended."""
+    raw = '{"pay": 5, "currency": "GBP"'
+    cleaned = sanitize_model_output(raw)
+    assert cleaned.endswith("}")
+    # It should now parse — pay still present.
+    parsed = json.loads(cleaned)
+    assert parsed["pay"] == 5
+
+
+def test_sanitize_empty_input_returns_empty() -> None:
+    assert sanitize_model_output("") == ""
+    assert sanitize_model_output("   \n\n   ") == ""
+
+
+def test_sanitize_handles_extra_whitespace() -> None:
+    raw = '\n\n   ```json   \n  {"pay": 5}  \n   ```   \n'
+    assert sanitize_model_output(raw) == '{"pay": 5}'
+
+
+def test_extract_returns_low_confidence_when_parse_fails_twice() -> None:
+    """If both calls return unparseable text, the pipeline degrades gracefully."""
+
+    def _gibberish(*_args, **_kwargs) -> str:
+        return "this is not json at all, no braces anywhere"
+
+    png = _black_png()
+    with patch.object(extractor, "_call_vision_model", side_effect=_gibberish):
+        result = extractor.extract_from_image(png)
+
+    assert result.confidence == "low"
+    assert "could not be parsed" in result.notes.lower()
+    assert result.pay is None
