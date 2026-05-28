@@ -102,6 +102,34 @@ DELIVEROO_EXTRACTION_PROMPT = f"""You are an expert data extractor for **Deliver
 The screenshot is from the Deliveroo Rider app. Read it and emit ONE valid
 JSON object — no markdown, no fences, no prose.
 
+# CRITICAL OUTPUT FORMAT — READ THIS FIRST
+Return ONLY a raw JSON object. No markdown. No backticks. No explanation.
+Start your response with `{{` and end with `}}`.
+Do NOT prefix with the word "json". Do NOT wrap in ```json ... ```.
+Do NOT add commentary before or after.
+Your entire output must be parseable by Python's `json.loads` as-is.
+
+# VALUE FORMAT RULES — STRICT
+- ``pay`` MUST be a JSON number, NEVER a string. WRONG: "pay": "£6.50".
+  RIGHT: "pay": 6.50. Strip the £ sign yourself before emitting.
+- ``miles`` MUST be a JSON number, never include "mi". WRONG: "miles": "2.1 mi".
+  RIGHT: "miles": 2.1.
+- ``minutes`` MUST be a JSON integer, never include "min". WRONG:
+  "minutes": "18 min". RIGHT: "minutes": 18.
+- ``orders`` MUST be a JSON integer. WRONG: "orders": "2 stacked". RIGHT:
+  "orders": 2.
+- Do NOT nest objects inside numeric fields. WRONG:
+  "pay": {{"gross": 6.50, "tip": 1.00}}. RIGHT: "pay": 6.50 and mention the tip
+  in ``notes``.
+
+# FALLBACK RULE — VERY IMPORTANT
+If you cannot read a field clearly, return ``null`` for that field. NEVER skip
+the field entirely. NEVER return partial JSON. Every key in the schema below
+MUST appear in your output, even if its value is null or "unknown".
+
+For ``currency`` and ``platform`` use the string ``"unknown"`` instead of null
+(those two fields are strings, not nullable numbers).
+
 # Deliveroo visual cues you can rely on
 - Teal / cyan / turquoise accents (the Deliveroo brand colour).
 - Dark navy or black background, white text.
@@ -111,10 +139,11 @@ JSON object — no markdown, no fences, no prose.
 
 # Deliveroo-specific extraction rules
 1. **Pay**:
-   - The headline £ amount is the gross pay. Use that for ``pay``.
+   - The headline £ amount is the gross pay. Use that number for ``pay``.
    - If a breakdown like "£6.20 (Includes £1.00 tip)" is shown, still use the
-     gross headline figure (£6.20) and mention the tip in ``notes``.
-   - If only a fee + tip are listed separately, sum them.
+     gross headline figure (6.20) and mention the tip in ``notes``.
+   - If only a fee + tip are listed separately, sum them into one number.
+   - Always strip the £ sign — emit the bare number (e.g. 6.50, not "£6.50").
 
 2. **Orders (single vs stacked)**:
    - Look for words like "Stacked", "Multi-order", "2 orders", or two
@@ -131,18 +160,29 @@ JSON object — no markdown, no fences, no prose.
      Two separate chips, one with distance, one with time → combine.
    - If distance is in km ("3.4 km"), convert to miles (1 km = 0.621371 mi)
      and mention the conversion in ``notes``.
+   - Emit numbers only — no "mi" suffix, no "min" suffix.
 
 4. **Currency**: "£" → "GBP". Always.
 
 5. **Platform**: this screenshot IS Deliveroo. Set ``platform`` = "deliveroo".
 
-# Output schema (exact shape, no extra keys)
+# Output schema (exact shape, every key required, no extras)
 {EXPECTED_SCHEMA_EXAMPLE.replace('"uber_eats"', '"deliveroo"')}
 
-Set any field you cannot read clearly to null (use "unknown" only for
-``currency`` and ``platform``). Put ambiguities in ``notes``.
+# One-shot example — EXACT format of a valid response
+{{"pay": 6.50, "currency": "GBP", "miles": 2.1, "minutes": 18, "orders": 1, "platform": "deliveroo", "confidence": "high", "notes": "Single order, tip £1.00 included in gross pay.", "raw_text": "Deliveroo · £6.50 · 2.1 mi · 18 min · 1 delivery"}}
 
-Emit the JSON object now. ONLY the JSON. No fences. No commentary.
+# Another one-shot example — stacked order with km converted
+{{"pay": 11.20, "currency": "GBP", "miles": 3.7, "minutes": 32, "orders": 2, "platform": "deliveroo", "confidence": "high", "notes": "Stacked order: 2 restaurants. Distance shown as 6.0 km, converted to 3.7 mi.", "raw_text": "Stacked · £11.20 · 6.0 km · 32 min · 2 orders"}}
+
+# Final reminder before you respond
+- Start with `{{`
+- End with `}}`
+- All 9 keys present (pay, currency, miles, minutes, orders, platform, confidence, notes, raw_text)
+- Numbers as numbers (not strings)
+- No "json" prefix, no ``` fences, no prose
+
+Emit the JSON object for the attached screenshot now.
 """
 
 

@@ -177,6 +177,17 @@ def calculate_confidence(result: dict[str, Any]) -> Literal["high", "medium", "l
 _FENCE_OPEN_RE = re.compile(r"^\s*```[a-zA-Z0-9_+\-]*\s*\n?")
 _FENCE_CLOSE_RE = re.compile(r"\n?\s*```\s*$")
 
+# Matches a bare "json" / "JSON" prefix that some models emit when they have
+# been told not to use fences but still want to "label" the output. Examples:
+#   json\n{...}
+#   JSON: {...}
+#   Json -\n{...}
+_JSON_LABEL_PREFIX_RE = re.compile(r"^\s*json\s*[:\-]?\s*\n?", re.IGNORECASE)
+
+# Matches numeric literals embedded in a string, e.g. " £6.50 " → "6.50",
+# " 2.1 mi" → "2.1", "18 min" → "18". Capture is the bare number.
+_FIRST_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
 
 def _strip_json_fences(text: str) -> str:
     """Remove ``` and ```json fences (open + close) from a text block."""
@@ -186,6 +197,17 @@ def _strip_json_fences(text: str) -> str:
     return stripped.strip()
 
 
+def _strip_json_label_prefix(text: str) -> str:
+    """Remove a leading 'json' / 'JSON:' label some models add as a header."""
+    stripped = text.lstrip()
+    # Only strip the label if what follows clearly starts a JSON object —
+    # otherwise we might eat real content.
+    candidate = _JSON_LABEL_PREFIX_RE.sub("", stripped, count=1)
+    if candidate is not stripped and candidate.lstrip().startswith("{"):
+        return candidate.lstrip()
+    return text
+
+
 def sanitize_model_output(raw: str) -> str:
     """Aggressively clean a model response so it parses as JSON.
 
@@ -193,8 +215,10 @@ def sanitize_model_output(raw: str) -> str:
 
     1. Strip leading/trailing whitespace.
     2. Strip ```/```json markdown fences (both open and close).
-    3. Strip any text before the first ``{`` and after the last ``}``.
-    4. If the JSON is missing a final ``}`` (truncated output), append one.
+    3. Strip a bare ``json`` / ``JSON:`` label prefix some models emit when
+       fences are disabled (e.g. ``"json\\n{...}"``).
+    4. Strip any text before the first ``{`` and after the last ``}``.
+    5. If the JSON is missing a final ``}`` (truncated output), append one.
 
     Args:
         raw: Raw text from the vision model.
@@ -207,6 +231,7 @@ def sanitize_model_output(raw: str) -> str:
         return ""
 
     cleaned = _strip_json_fences(raw)
+    cleaned = _strip_json_label_prefix(cleaned)
     if not cleaned:
         return ""
 
@@ -241,6 +266,150 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON decode failed: {exc.msg} at pos {exc.pos}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Type coercion — handles model output that ignored "emit numbers as numbers"
+# ---------------------------------------------------------------------------
+
+
+def force_numeric(value: Any, *, as_int: bool = False) -> float | int | None:
+    """Coerce a possibly-stringified, possibly-unit-suffixed value to number.
+
+    Handles the messy shapes vision models emit when they ignore "emit numbers
+    as numbers" instructions:
+
+    - Already a number (int/float)  → cast to the requested type.
+    - ``None`` / empty string       → return ``None``.
+    - ``"£6.50"``                   → ``6.50``  (currency symbol stripped).
+    - ``"6.50"``                    → ``6.50``  (plain string number).
+    - ``"2.1 mi"`` / ``"3.4 km"``   → ``2.1`` / ``3.4`` (unit stripped — note,
+      km→mi conversion is NOT done here; that is the prompt's job).
+    - ``"18 min"`` / ``"18m"``      → ``18``.
+    - ``"2 stacked"`` / ``"2 orders"`` → ``2``.
+    - ``{"gross": 6.50, "tip": 1.0}`` (nested object) → ``6.50`` (uses the
+      first numeric value found among common keys: ``gross``, ``total``,
+      ``amount``, ``value``).
+    - Anything else                  → ``None``.
+
+    Args:
+        value: The raw value from the parsed JSON.
+        as_int: When True, return ``int`` instead of ``float``.
+
+    Returns:
+        The coerced number, or ``None`` if no number could be recovered.
+    """
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, bool):
+        # ``bool`` is a subclass of ``int`` — guard against True/False sneaking
+        # through as 1/0.
+        return None
+
+    if isinstance(value, (int, float)):
+        return int(value) if as_int else float(value)
+
+    if isinstance(value, dict):
+        # Nested object — pull the most likely number out by key preference.
+        for key in ("gross", "total", "amount", "value", "headline", "number"):
+            if key in value:
+                recovered = force_numeric(value[key], as_int=as_int)
+                if recovered is not None:
+                    return recovered
+        # Fallback: first numeric value in dict.
+        for v in value.values():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return int(v) if as_int else float(v)
+        return None
+
+    if isinstance(value, list):
+        # First numeric element of a list.
+        for item in value:
+            recovered = force_numeric(item, as_int=as_int)
+            if recovered is not None:
+                return recovered
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        match = _FIRST_NUMBER_RE.search(text)
+        if not match:
+            return None
+        try:
+            number = float(match.group(0))
+        except (TypeError, ValueError):
+            return None
+        return int(number) if as_int else number
+
+    return None
+
+
+def _normalize_extraction_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Post-parse cleanup: coerce known-numeric fields and log corrections.
+
+    The Deliveroo prompt insists on raw numbers, but the model occasionally
+    still emits strings (``"£6.50"``) or nested objects (``{"gross": 6.5}``)
+    for ``pay`` and unit-suffixed strings (``"2.1 mi"``) for the metric
+    fields. This function rewrites them in place so downstream coercion sees
+    clean Python numbers.
+
+    Corrections are logged at INFO level so we can spot prompt drift in
+    production.
+    """
+    corrections: list[str] = []
+
+    def _coerce(field: str, *, as_int: bool) -> None:
+        if field not in parsed:
+            return
+        original = parsed[field]
+        if original is None:
+            return
+        if isinstance(original, bool):
+            parsed[field] = None
+            corrections.append(f"{field}: bool→null")
+            return
+        if isinstance(original, (int, float)):
+            if as_int and isinstance(original, float):
+                parsed[field] = int(original)
+                corrections.append(f"{field}: float→int ({original}→{parsed[field]})")
+            return
+        coerced = force_numeric(original, as_int=as_int)
+        if coerced is None:
+            parsed[field] = None
+            corrections.append(f"{field}: unrecoverable ({original!r}→null)")
+        else:
+            parsed[field] = coerced
+            corrections.append(f"{field}: {original!r}→{coerced}")
+
+    _coerce("pay", as_int=False)
+    _coerce("miles", as_int=False)
+    _coerce("minutes", as_int=True)
+    _coerce("orders", as_int=True)
+
+    # Currency — sometimes returned with the £ symbol embedded.
+    if "currency" in parsed and parsed["currency"] is not None:
+        cur = str(parsed["currency"]).strip().upper()
+        if "£" in cur or "GBP" in cur:
+            new = "GBP"
+        elif "$" in cur or "USD" in cur:
+            new = "USD"
+        elif "€" in cur or "EUR" in cur:
+            new = "EUR"
+        elif cur in {"GBP", "USD", "EUR", "UNKNOWN"}:
+            new = cur if cur != "UNKNOWN" else "unknown"
+        else:
+            new = "unknown"
+        if new != parsed["currency"]:
+            corrections.append(f"currency: {parsed['currency']!r}→{new!r}")
+            parsed["currency"] = new
+
+    if corrections:
+        logger.info("Post-parse coercions applied: %s", "; ".join(corrections))
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +612,14 @@ def _looks_like_deliveroo(image_bytes: bytes) -> bool:
 
 
 def _coerce_result(parsed: dict[str, Any], raw_text_fallback: str) -> ExtractionResult:
-    """Build an ``ExtractionResult`` from a parsed dict, applying defaults."""
+    """Build an ``ExtractionResult`` from a parsed dict.
+
+    ``parsed`` should already have been run through
+    ``_normalize_extraction_payload`` so that numeric fields are real numbers.
+    This function is the *last* line of defence — it still calls
+    ``force_numeric`` on each field so that direct test callers (and any
+    future entry point that skips normalization) cannot break the schema.
+    """
     platform = str(parsed.get("platform") or "unknown").lower().replace(" ", "_")
     if platform not in {
         "uber_eats",
@@ -460,30 +636,14 @@ def _coerce_result(parsed: dict[str, Any], raw_text_fallback: str) -> Extraction
     if currency not in {"GBP", "USD", "EUR", "unknown"}:
         currency = "unknown"
 
-    def _maybe_float(v: Any) -> float | None:
-        if v is None or v == "":
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    def _maybe_int(v: Any) -> int | None:
-        if v is None or v == "":
-            return None
-        try:
-            return int(float(v))
-        except (TypeError, ValueError):
-            return None
-
     server_confidence = calculate_confidence(parsed)
 
     return ExtractionResult(
-        pay=_maybe_float(parsed.get("pay")),
+        pay=force_numeric(parsed.get("pay"), as_int=False),
         currency=currency,  # type: ignore[arg-type]
-        miles=_maybe_float(parsed.get("miles")),
-        minutes=_maybe_int(parsed.get("minutes")),
-        orders=_maybe_int(parsed.get("orders")),
+        miles=force_numeric(parsed.get("miles"), as_int=False),
+        minutes=force_numeric(parsed.get("minutes"), as_int=True),
+        orders=force_numeric(parsed.get("orders"), as_int=True),
         platform=platform,  # type: ignore[arg-type]
         confidence=server_confidence,
         notes=str(parsed.get("notes") or "").strip(),
@@ -587,6 +747,11 @@ def extract_from_image(
                 exc,
             )
             return _low_confidence_failure(raw_response, parse_errors)
+
+    # Post-parse normalization: rewrite string/nested-object numeric fields
+    # before the Pydantic coercion happens. Logged corrections give us
+    # production visibility into prompt drift.
+    parsed = _normalize_extraction_payload(parsed)
 
     result = _coerce_result(parsed, raw_text_fallback=raw_response[:1000])
 

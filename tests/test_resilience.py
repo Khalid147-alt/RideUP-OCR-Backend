@@ -220,6 +220,116 @@ def test_sanitize_handles_extra_whitespace() -> None:
     assert sanitize_model_output(raw) == '{"pay": 5}'
 
 
+def test_sanitize_strips_bare_json_label_prefix() -> None:
+    """A response that starts with ``json\\n{...}`` (no fences) parses cleanly."""
+    raw = 'json\n{"pay": 5}'
+    cleaned = sanitize_model_output(raw)
+    assert cleaned == '{"pay": 5}'
+
+
+def test_sanitize_strips_json_colon_label_prefix() -> None:
+    raw = 'JSON: {"pay": 5}'
+    cleaned = sanitize_model_output(raw)
+    assert cleaned.startswith("{") and cleaned.endswith("}")
+
+
+def test_sanitize_does_not_eat_word_inside_value() -> None:
+    """``"json"`` only stripped as a prefix, never inside the JSON itself."""
+    raw = '{"notes": "json was malformed"}'
+    cleaned = sanitize_model_output(raw)
+    assert "json was malformed" in cleaned
+
+
+# ---------------------------------------------------------------------------
+# 4. force_numeric helper — used to recover from messy model outputs
+# ---------------------------------------------------------------------------
+
+
+def test_force_numeric_passes_through_numbers() -> None:
+    assert extractor.force_numeric(5.5) == 5.5
+    assert extractor.force_numeric(5, as_int=True) == 5
+    assert extractor.force_numeric(5.7, as_int=True) == 5
+
+
+def test_force_numeric_handles_currency_string() -> None:
+    assert extractor.force_numeric("£6.50") == 6.50
+    assert extractor.force_numeric("$12.00") == 12.00
+    assert extractor.force_numeric("€9.99") == 9.99
+
+
+def test_force_numeric_handles_unit_suffixes() -> None:
+    assert extractor.force_numeric("2.1 mi") == 2.1
+    assert extractor.force_numeric("3.4 km") == 3.4
+    assert extractor.force_numeric("18 min", as_int=True) == 18
+    assert extractor.force_numeric("2 stacked", as_int=True) == 2
+
+
+def test_force_numeric_handles_nested_dict_pay() -> None:
+    assert extractor.force_numeric({"gross": 6.50, "tip": 1.00}) == 6.50
+    assert extractor.force_numeric({"total": 9.99}) == 9.99
+    # Fallback when known keys absent — first numeric value wins.
+    assert extractor.force_numeric({"foo": "bar", "x": 4.2}) == 4.2
+
+
+def test_force_numeric_handles_empty_and_invalid() -> None:
+    assert extractor.force_numeric(None) is None
+    assert extractor.force_numeric("") is None
+    assert extractor.force_numeric("  ") is None
+    assert extractor.force_numeric("no numbers here") is None
+    assert extractor.force_numeric(True) is None  # booleans rejected
+    assert extractor.force_numeric(False) is None
+
+
+def test_force_numeric_handles_list() -> None:
+    assert extractor.force_numeric([None, "2.1 mi", "3.4 mi"]) == 2.1
+
+
+# ---------------------------------------------------------------------------
+# 5. _normalize_extraction_payload — full post-parse cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_payload_fixes_all_numeric_fields() -> None:
+    parsed = {
+        "pay": "£6.50",
+        "miles": "2.1 mi",
+        "minutes": "18 min",
+        "orders": "2 stacked",
+        "currency": "£",
+        "platform": "deliveroo",
+    }
+    out = extractor._normalize_extraction_payload(parsed)
+    assert out["pay"] == 6.50
+    assert out["miles"] == 2.1
+    assert out["minutes"] == 18
+    assert out["orders"] == 2
+    assert out["currency"] == "GBP"
+
+
+def test_normalize_payload_handles_nested_pay() -> None:
+    parsed = {"pay": {"gross": 7.20, "tip": 1.50}}
+    out = extractor._normalize_extraction_payload(parsed)
+    assert out["pay"] == 7.20
+
+
+def test_normalize_payload_preserves_already_clean_data() -> None:
+    parsed = {
+        "pay": 6.50,
+        "miles": 2.1,
+        "minutes": 18,
+        "orders": 1,
+        "currency": "GBP",
+    }
+    out = extractor._normalize_extraction_payload(parsed)
+    assert out == parsed  # unchanged
+
+
+def test_normalize_payload_currency_symbol_to_iso() -> None:
+    assert extractor._normalize_extraction_payload({"currency": "£"})["currency"] == "GBP"
+    assert extractor._normalize_extraction_payload({"currency": "GBP £"})["currency"] == "GBP"
+    assert extractor._normalize_extraction_payload({"currency": "USD"})["currency"] == "USD"
+
+
 def test_extract_returns_low_confidence_when_parse_fails_twice() -> None:
     """If both calls return unparseable text, the pipeline degrades gracefully."""
 

@@ -295,3 +295,116 @@ def test_detect_image_quality_poor_when_tiny_bytes() -> None:
 def test_detect_image_quality_poor_when_low_resolution() -> None:
     tiny = _make_png(width=100, height=100)
     assert extractor.detect_image_quality(tiny) == "poor"
+
+
+# ---------------------------------------------------------------------------
+# Deliveroo edge cases — model returns malformed-but-recoverable JSON
+# ---------------------------------------------------------------------------
+
+
+def _deliveroo_payload(**overrides: Any) -> dict[str, Any]:
+    """Baseline Deliveroo extraction payload; tests override specific fields."""
+    base = {
+        "pay": 6.50,
+        "currency": "GBP",
+        "miles": 2.1,
+        "minutes": 18,
+        "orders": 1,
+        "platform": "deliveroo",
+        "confidence": "high",
+        "notes": "",
+        "raw_text": "Deliveroo · £6.50 · 2.1 mi · 18 min · 1 delivery",
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_deliveroo_pay_as_string_with_currency_symbol(
+    client: AsyncClient,
+    good_png: bytes,
+) -> None:
+    """``"pay": "£6.50"`` should be coerced to ``6.50`` (float)."""
+    payload = _deliveroo_payload(pay="£6.50")
+    with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
+        files = {"image": ("deliveroo.png", good_png, "image/png")}
+        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pay"] == 6.50
+    assert isinstance(body["pay"], float)
+    assert body["platform"] == "deliveroo"
+
+
+@pytest.mark.asyncio
+async def test_deliveroo_miles_with_unit_suffix(
+    client: AsyncClient,
+    good_png: bytes,
+) -> None:
+    """``"miles": "2.1 mi"`` should be coerced to ``2.1`` (float, suffix stripped)."""
+    payload = _deliveroo_payload(miles="2.1 mi")
+    with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
+        files = {"image": ("deliveroo.png", good_png, "image/png")}
+        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["miles"] == 2.1
+    assert isinstance(body["miles"], float)
+
+
+@pytest.mark.asyncio
+async def test_deliveroo_minutes_with_unit_suffix(
+    client: AsyncClient,
+    good_png: bytes,
+) -> None:
+    """``"minutes": "18 min"`` should be coerced to ``18`` (int, suffix stripped)."""
+    payload = _deliveroo_payload(minutes="18 min")
+    with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
+        files = {"image": ("deliveroo.png", good_png, "image/png")}
+        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["minutes"] == 18
+    assert isinstance(body["minutes"], int)
+
+
+@pytest.mark.asyncio
+async def test_deliveroo_nested_pay_object(
+    client: AsyncClient,
+    good_png: bytes,
+) -> None:
+    """``"pay": {"gross": 6.50, "tip": 1.00}`` should extract the gross figure."""
+    payload = _deliveroo_payload(pay={"gross": 6.50, "tip": 1.00})
+    with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
+        files = {"image": ("deliveroo.png", good_png, "image/png")}
+        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pay"] == 6.50
+    assert isinstance(body["pay"], float)
+
+
+@pytest.mark.asyncio
+async def test_deliveroo_markdown_wrapped_response(
+    client: AsyncClient,
+    good_png: bytes,
+) -> None:
+    """A markdown-fenced response with a ``json\\n`` label should still parse."""
+    inner = json.dumps(_deliveroo_payload(pay="£6.50", miles="2.1 mi", minutes="18 min"))
+    # Worst-case shape: leading "json" label PLUS ```json fences PLUS prose.
+    wrapped = f"Sure! Here's the data:\n\n```json\n{inner}\n```\n\nLet me know if you need more."
+    with patch.object(extractor, "_call_vision_model", return_value=wrapped):
+        files = {"image": ("deliveroo.png", good_png, "image/png")}
+        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pay"] == 6.50
+    assert body["miles"] == 2.1
+    assert body["minutes"] == 18
+    assert body["platform"] == "deliveroo"
+    assert body["confidence"] == "high"
