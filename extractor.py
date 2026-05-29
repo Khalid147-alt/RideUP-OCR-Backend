@@ -150,14 +150,41 @@ def calculate_confidence(result: dict[str, Any]) -> Literal["high", "medium", "l
       the model reported ``"medium"`` or ``"low"``.
     - **low**    — fewer than 3 core fields, or any image-quality concern.
 
+    Deliveroo V2 carve-out
+    ----------------------
+    The Deliveroo V2 offer-card layout does not display distance or estimated
+    time at all — they are genuinely absent from the screen, not unreadable.
+    Penalising a Deliveroo extraction for missing miles/minutes would punish
+    a correct read of an incomplete layout. So: when ``platform`` is
+    ``deliveroo`` AND both ``miles`` and ``minutes`` are null, we score
+    confidence on ``pay`` + ``orders`` alone:
+
+      - pay and orders both present   → "high"
+      - only pay present              → "medium"
+      - neither present               → "low"
+
     Args:
         result: Parsed JSON response from the vision model.
 
     Returns:
         One of ``"high"``, ``"medium"``, ``"low"``.
     """
-    found = sum(1 for field in _CORE_FIELDS if result.get(field) is not None)
+    platform = str(result.get("platform") or "").lower()
+    miles = result.get("miles")
+    minutes = result.get("minutes")
     model_claim = str(result.get("confidence", "")).lower()
+
+    # Deliveroo V2: distance/time are layout-absent, not unreadable.
+    if platform == "deliveroo" and miles is None and minutes is None:
+        has_pay = result.get("pay") is not None
+        has_orders = result.get("orders") is not None
+        if has_pay and has_orders:
+            return "medium" if model_claim == "low" else "high"
+        if has_pay:
+            return "medium"
+        return "low"
+
+    found = sum(1 for field in _CORE_FIELDS if result.get(field) is not None)
 
     if found == len(_CORE_FIELDS):
         if model_claim in {"low", "medium"}:
@@ -266,6 +293,84 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON decode failed: {exc.msg} at pos {exc.pos}") from exc
+
+
+# ---------------------------------------------------------------------------
+# raw_text defensive validation
+# ---------------------------------------------------------------------------
+#
+# Real stress-test responses revealed Gemini occasionally echoing its own
+# JSON output back into the ``raw_text`` field — values like ``{"pay": 11``
+# or ``{\n  "pay": 7.22``. This is a fundamentally wrong read: ``raw_text``
+# is meant to hold the text the model literally saw in the image, not the
+# JSON it is about to emit. We catch and clear it here so contaminated
+# values never reach the client.
+
+# A response that opens with one of these tokens is structurally JSON, not
+# image text. Whitespace is stripped first, so leading newlines/spaces do
+# not save a contaminated value.
+_RAW_TEXT_FORBIDDEN_PREFIXES: tuple[str, ...] = ("{", "[")
+
+# A JSON-escaped quoted key — the smoking gun for "model echoed its own
+# output". We check both ``\"pay\"`` and the unescaped variant because the
+# value might or might not have already been JSON-unescaped at this point.
+_RAW_TEXT_JSON_SIGNATURES: tuple[str, ...] = (
+    '\\"pay\\"',
+    '"pay":',
+    '\\"currency\\"',
+    '"currency":',
+)
+
+# Placeholder written into ``raw_text`` after a contaminated value is
+# cleared. Mirrors the brief: never return raw_text starting with { or [,
+# and never return an empty string either.
+_RAW_TEXT_PLACEHOLDER = "extracted from image"
+
+
+def validate_raw_text(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Strip JSON-shaped contamination from ``parsed["raw_text"]``.
+
+    If the model echoed its own JSON output back into the ``raw_text`` field
+    (a documented failure mode), the contaminated value is replaced with a
+    neutral placeholder and a warning is logged. The function mutates and
+    returns the same dict for chaining.
+
+    A value is considered contaminated if it:
+      - is a string, and
+      - after stripping whitespace, starts with ``{`` or ``[``, OR
+      - contains a JSON-escaped key signature like ``\\"pay\\"``.
+
+    Args:
+        parsed: The decoded JSON dict from the model.
+
+    Returns:
+        The same dict with a cleaned ``raw_text`` value.
+    """
+    raw = parsed.get("raw_text", "")
+    if not isinstance(raw, str):
+        return parsed
+
+    stripped = raw.strip()
+    starts_with_json = any(
+        stripped.startswith(prefix) for prefix in _RAW_TEXT_FORBIDDEN_PREFIXES
+    )
+    has_json_signature = any(sig in raw for sig in _RAW_TEXT_JSON_SIGNATURES)
+
+    if starts_with_json or has_json_signature:
+        logger.warning(
+            "raw_text contained JSON (first 80 chars: %r); "
+            "cleared to prevent confusion.",
+            raw[:80],
+        )
+        parsed["raw_text"] = _RAW_TEXT_PLACEHOLDER
+        return parsed
+
+    if not stripped:
+        # Empty raw_text is also unhelpful — keep the placeholder rule
+        # consistent: every response carries something meaningful here.
+        parsed["raw_text"] = _RAW_TEXT_PLACEHOLDER
+
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -556,20 +661,27 @@ def _call_vision_model(
 def _select_prompt(image_bytes: bytes, hint: str | None) -> str:
     """Choose the best prompt variant for this image.
 
-    Routing priority:
+    Routing priority (mirrors the brief from the client stress test):
 
-    1. An explicit ``deliveroo`` hint always wins — the caller knows best.
-    2. If the image looks like Deliveroo by colour signature (teal-dominant),
-       use the Deliveroo prompt.
+    1. An explicit ``deliveroo`` hint always wins — the caller knows best
+       and the Deliveroo V2 prompt is now the default for that hint.
+    2. If the image looks like Deliveroo by colour signature (teal pixel
+       ratio above the threshold), use the Deliveroo V2 prompt.
     3. Otherwise, use the master prompt (optionally augmented with the hint).
+
+    Detection 2 originally included "Accept and go" text matching and
+    suitcase-icon detection, but both require OCR — which is exactly what
+    Gemini does in step 4 of the pipeline. They are folded into the
+    Deliveroo V2 prompt itself: once teal triggers routing, the prompt
+    handles V2 layout detection by content.
     """
     hint_clean = (hint or "").strip().lower()
     if hint_clean == "deliveroo":
-        logger.info("Routing to Deliveroo prompt (explicit hint).")
+        logger.info("Routing to Deliveroo V2 prompt (explicit hint).")
         return build_extraction_prompt("deliveroo")
 
     if _looks_like_deliveroo(image_bytes):
-        logger.info("Routing to Deliveroo prompt (teal colour signature detected).")
+        logger.info("Routing to Deliveroo V2 prompt (teal colour signature detected).")
         return build_extraction_prompt("deliveroo")
 
     return build_extraction_prompt(hint_clean or None)
@@ -600,7 +712,10 @@ def _looks_like_deliveroo(image_bytes: bytes) -> bool:
     if total == 0:
         return False
     ratio = teal_pixels / total
-    if ratio >= 0.06:  # ~6% of the image — generous but specific to teal UIs
+    # Threshold matches the brief from the client stress test: ≥5% teal
+    # pixels is a reliable Deliveroo V2 signature (the teal "Accept and go"
+    # button alone occupies roughly this much of a typical offer screen).
+    if ratio >= 0.05:
         logger.debug("Teal pixel ratio: %.3f (Deliveroo signature)", ratio)
         return True
     return False
@@ -752,6 +867,11 @@ def extract_from_image(
     # before the Pydantic coercion happens. Logged corrections give us
     # production visibility into prompt drift.
     parsed = _normalize_extraction_payload(parsed)
+
+    # Defensive: scrub JSON contamination out of raw_text before it leaks
+    # into the client response. See validate_raw_text() for the failure
+    # mode this guards against.
+    parsed = validate_raw_text(parsed)
 
     result = _coerce_result(parsed, raw_text_fallback=raw_response[:1000])
 

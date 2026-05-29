@@ -56,15 +56,20 @@ def _black_png(width: int = 600, height: int = 600) -> bytes:
 
 
 def test_deliveroo_hint_routes_to_deliveroo_prompt() -> None:
-    """An explicit ``deliveroo`` hint always selects the Deliveroo prompt."""
+    """An explicit ``deliveroo`` hint always selects a Deliveroo prompt.
+
+    Post-V2 cutover this is the V2 prompt — V2 is now the default Deliveroo
+    template because the V2 layout is what the client stress test exposed as
+    the primary failure mode.
+    """
     chosen = _select_prompt(_black_png(), hint="deliveroo")
-    assert chosen == prompts.DELIVEROO_EXTRACTION_PROMPT
+    assert chosen == prompts.DELIVEROO_V2_EXTRACTION_PROMPT
 
 
 def test_teal_image_routes_to_deliveroo_prompt() -> None:
-    """A teal-dominated image triggers the Deliveroo prompt automatically."""
+    """A teal-dominated image triggers the Deliveroo V2 prompt automatically."""
     chosen = _select_prompt(_teal_png(), hint=None)
-    assert chosen == prompts.DELIVEROO_EXTRACTION_PROMPT
+    assert chosen == prompts.DELIVEROO_V2_EXTRACTION_PROMPT
 
 
 def test_non_teal_image_uses_master_prompt() -> None:
