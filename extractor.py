@@ -54,7 +54,11 @@ _MIN_DIMENSION_PX = 300
 _MIN_FILE_SIZE_BYTES = 10 * 1024  # 10 KB
 
 # Gemini call parameters.
-_MAX_OUTPUT_TOKENS = 500
+# ``_MAX_OUTPUT_TOKENS`` was raised from 500 → 1024 after the stress test
+# surfaced "unterminated string at pos 137" errors: the Deliveroo V2 prompt
+# now emits a much longer ``raw_text`` (full restaurant + address strings)
+# and the 500-token cap was clipping the closing brace.
+_MAX_OUTPUT_TOKENS = 1024
 _TEMPERATURE = 0.0
 
 # Backoff: max attempts and base delays (seconds). The Nth retry sleeps
