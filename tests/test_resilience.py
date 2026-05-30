@@ -128,7 +128,14 @@ def test_backoff_succeeds_after_two_transient_failures() -> None:
 
 
 def test_backoff_gives_up_after_three_attempts() -> None:
-    """After the configured max attempts, the last exception propagates."""
+    """After the configured max attempts, the rate-limit exhaustion surfaces.
+
+    503 is in the rate-limit class (see ``_RATE_LIMIT_ERRORS``), so once the
+    three attempts are spent the function raises ``_RateLimitExhausted``
+    rather than the underlying ``ServiceUnavailable``. The original error
+    is preserved on ``exc.original`` so the pipeline can include it in the
+    low-confidence ``notes``.
+    """
     calls = {"n": 0}
 
     def _always_503() -> str:
@@ -136,10 +143,30 @@ def test_backoff_gives_up_after_three_attempts() -> None:
         raise ServiceUnavailable("503 always")
 
     with patch.object(extractor.time, "sleep"):
-        with pytest.raises(ServiceUnavailable):
+        with pytest.raises(extractor._RateLimitExhausted) as excinfo:
             _with_api_retries("test", _always_503)
 
     assert calls["n"] == 3  # _MAX_API_ATTEMPTS
+    assert isinstance(excinfo.value.original, ServiceUnavailable)
+
+
+def test_backoff_fast_class_propagates_underlying_exception() -> None:
+    """500 / DeadlineExceeded (fast class) still re-raise the original error.
+
+    Only the rate-limit class is converted to ``_RateLimitExhausted`` — real
+    upstream incidents must still surface as 502 to the client.
+    """
+    calls = {"n": 0}
+
+    def _always_500() -> str:
+        calls["n"] += 1
+        raise InternalServerError("500 always")
+
+    with patch.object(extractor.time, "sleep"):
+        with pytest.raises(InternalServerError):
+            _with_api_retries("test", _always_500)
+
+    assert calls["n"] == 3
 
 
 def test_backoff_does_not_retry_non_transient_errors() -> None:

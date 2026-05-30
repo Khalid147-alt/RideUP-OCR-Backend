@@ -61,21 +61,60 @@ _MIN_FILE_SIZE_BYTES = 10 * 1024  # 10 KB
 _MAX_OUTPUT_TOKENS = 1024
 _TEMPERATURE = 0.0
 
-# Backoff: max attempts and base delays (seconds). The Nth retry sleeps
-# ``_BACKOFF_DELAYS[N-1]`` plus a small jitter.
+# Backoff schedules. Two classes:
+#
+# - "Fast" backoff for transient server errors and timeouts where retrying
+#   immediately is likely to succeed (500 hiccup, deadline exceeded).
+# - "Rate-limit" backoff for 429 / quota / 503-style capacity errors where
+#   the upstream is telling us to slow down. Gemini's free tier hits 429
+#   regularly and needs much longer pauses; the brief specifies a fixed
+#   15s / 30s / 60s ladder.
 _MAX_API_ATTEMPTS = 3
 _BACKOFF_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+_RATE_LIMIT_BACKOFF_DELAYS: tuple[float, ...] = (15.0, 30.0, 60.0)
 _BACKOFF_JITTER_SECONDS = 0.25
 
-# Transient errors worth retrying. ``GoogleAPIError`` subclasses cover the
-# 429 / 502 / 503 / deadline-exceeded surface.
-_RETRYABLE_API_ERRORS: tuple[type[Exception], ...] = (
+# Rate-limit / capacity errors: 429 family + 503. These get the long ladder
+# and, after exhaustion, are converted to a low-confidence successful
+# response instead of propagating as a 502 to the client.
+_RATE_LIMIT_ERRORS: tuple[type[Exception], ...] = (
     TooManyRequests,        # 429
     ResourceExhausted,      # 429 quota
+    ServiceUnavailable,     # 503 (treated as capacity-class per the brief)
+)
+
+# Other transient server errors that warrant retrying with the fast ladder.
+# A 500 or a timeout typically clears within seconds — no reason to sleep
+# a minute waiting for it.
+_FAST_RETRY_ERRORS: tuple[type[Exception], ...] = (
     InternalServerError,    # 500
-    ServiceUnavailable,     # 503
     DeadlineExceeded,       # 504 / timeouts
 )
+
+# Combined surface — anything in here is retried (with the class-appropriate
+# ladder). Anything else (e.g. ``InvalidArgument`` — a 400) is non-retryable
+# and propagates immediately.
+_RETRYABLE_API_ERRORS: tuple[type[Exception], ...] = (
+    _RATE_LIMIT_ERRORS + _FAST_RETRY_ERRORS
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` is in the rate-limit / capacity class."""
+    return isinstance(exc, _RATE_LIMIT_ERRORS)
+
+
+class _RateLimitExhausted(Exception):
+    """Sentinel raised internally when the rate-limit backoff ladder is used up.
+
+    Caught by ``extract_from_image`` and converted to a low-confidence
+    ``ExtractionResult`` rather than propagating as a 502 to the client. Not
+    part of the public API.
+    """
+
+    def __init__(self, original: Exception) -> None:
+        self.original = original
+        super().__init__(f"Rate-limit retries exhausted: {original}")
 
 
 ImageQuality = Literal["good", "poor"]
@@ -546,14 +585,20 @@ def _ensure_client_configured() -> None:
     _client_configured = True
 
 
-def _sleep_backoff(attempt_index: int) -> None:
-    """Sleep with the backoff delay for the given (1-based) retry attempt.
+def _sleep_backoff(attempt_index: int, *, rate_limited: bool = False) -> None:
+    """Sleep for the appropriate backoff delay before attempt ``N+1``.
 
-    The first retry waits ~1s, the second ~2s, the third ~4s. A small random
-    jitter is added so concurrent callers do not all hammer the API at the
-    same instant.
+    Two ladders, picked by the ``rate_limited`` flag:
+
+    - Fast (default): 1s, 2s, 4s — for transient server errors / timeouts.
+    - Rate-limit:    15s, 30s, 60s — for 429 / quota / 503 capacity errors.
+
+    A small random jitter is added so concurrent callers do not all hammer
+    the API at the same instant. Argument index is 1-based: ``attempt=1``
+    means "we just finished attempt 1, sleep before attempt 2".
     """
-    base = _BACKOFF_DELAYS[min(attempt_index - 1, len(_BACKOFF_DELAYS) - 1)]
+    ladder = _RATE_LIMIT_BACKOFF_DELAYS if rate_limited else _BACKOFF_DELAYS
+    base = ladder[min(attempt_index - 1, len(ladder) - 1)]
     jitter = random.uniform(0.0, _BACKOFF_JITTER_SECONDS)
     time.sleep(base + jitter)
 
@@ -562,7 +607,22 @@ def _with_api_retries(
     operation_name: str,
     func: Callable[[], str],
 ) -> str:
-    """Run ``func`` with exponential backoff on transient Gemini failures.
+    """Run ``func`` with class-aware backoff on transient Gemini failures.
+
+    Two error classes, two ladders (see ``_sleep_backoff``):
+
+    - Rate-limit class (429 / quota / 503) — wait 15s, 30s, 60s. When the
+      ladder is exhausted, raises ``_RateLimitExhausted`` which the
+      pipeline converts to a low-confidence ``ExtractionResult``. This
+      keeps the client request HTTP-200 even when the upstream is
+      throttling us — the brief explicitly asks for this graceful
+      degradation rather than a 502.
+    - Fast class (500 / deadline) — wait 1s, 2s, 4s. When exhausted, the
+      underlying ``GoogleAPIError`` propagates and the FastAPI layer
+      maps it to a 502 — these are real upstream incidents, not quota.
+
+    Non-retryable errors (e.g. 400 ``InvalidArgument``) propagate
+    immediately on the first attempt.
 
     Args:
         operation_name: Short label for logging (e.g. "extract", "retry").
@@ -573,7 +633,10 @@ def _with_api_retries(
         The successful response text.
 
     Raises:
-        GoogleAPIError: re-raised if the final attempt also fails.
+        _RateLimitExhausted: rate-limit ladder ran out — caller should
+            return a low-confidence result instead of a 502.
+        GoogleAPIError: fast-class ladder ran out — propagates as a real
+            upstream failure.
     """
     last_exc: Exception | None = None
 
@@ -582,6 +645,8 @@ def _with_api_retries(
             return func()
         except _RETRYABLE_API_ERRORS as exc:
             last_exc = exc
+            is_rate_limit = _is_rate_limit_error(exc)
+
             if attempt >= _MAX_API_ATTEMPTS:
                 logger.error(
                     "Gemini API call '%s' failed after %d attempts: %s",
@@ -589,20 +654,42 @@ def _with_api_retries(
                     attempt,
                     exc,
                 )
+                # Rate-limit exhaustion is degraded to a low-confidence
+                # 200 response upstream. Fast-class exhaustion is a real
+                # incident and surfaces as 502.
+                if is_rate_limit:
+                    raise _RateLimitExhausted(exc) from exc
                 raise
-            delay = _BACKOFF_DELAYS[min(attempt - 1, len(_BACKOFF_DELAYS) - 1)]
-            logger.warning(
-                "Gemini API call '%s' attempt %d/%d failed with %s; "
-                "retrying in ~%.1fs",
-                operation_name,
-                attempt,
-                _MAX_API_ATTEMPTS,
-                type(exc).__name__,
-                delay,
+
+            ladder = (
+                _RATE_LIMIT_BACKOFF_DELAYS if is_rate_limit else _BACKOFF_DELAYS
             )
-            _sleep_backoff(attempt)
+            delay = ladder[min(attempt - 1, len(ladder) - 1)]
+            if is_rate_limit:
+                # Wording matches the brief: visible in production logs as
+                # the rate-limit fingerprint for the on-call to grep for.
+                logger.warning(
+                    "Rate limit hit, waiting %.0fs before retry %d/%d... "
+                    "(operation=%s, error=%s)",
+                    delay,
+                    attempt,
+                    _MAX_API_ATTEMPTS,
+                    operation_name,
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Gemini API call '%s' attempt %d/%d failed with %s; "
+                    "retrying in ~%.1fs",
+                    operation_name,
+                    attempt,
+                    _MAX_API_ATTEMPTS,
+                    type(exc).__name__,
+                    delay,
+                )
+            _sleep_backoff(attempt, rate_limited=is_rate_limit)
         except GoogleAPIError as exc:
-            # Non-retryable Google API error (4xx other than 429) — bail out.
+            # Non-retryable Google API error (e.g. 400 InvalidArgument) — bail.
             logger.error(
                 "Gemini API call '%s' failed with non-retryable error: %s",
                 operation_name,
@@ -614,6 +701,31 @@ def _with_api_retries(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Unreachable: retry loop exited without result.")
+
+
+def _with_api_retries_tracked(
+    operation_name: str,
+    func: Callable[[], str],
+) -> tuple[str, int]:
+    """Run ``_with_api_retries`` and report how many attempts were used.
+
+    Returns a ``(text, attempts)`` tuple where ``attempts`` is the 1-based
+    count of attempts made — 1 means the call succeeded on the first try
+    (no retries needed); 2 or 3 means we retried. Exceptions propagate
+    identically to ``_with_api_retries``.
+
+    This exists so the pipeline can record ``retry_attempted=true`` in the
+    response notes when a retry actually happened, giving the client
+    visibility into rate-limit-induced slow responses.
+    """
+    attempts = {"n": 0}
+
+    def _counting_call() -> str:
+        attempts["n"] += 1
+        return func()
+
+    text = _with_api_retries(operation_name, _counting_call)
+    return text, attempts["n"]
 
 
 def _call_vision_model(
@@ -790,6 +902,48 @@ def _low_confidence_failure(
     )
 
 
+def _rate_limited_failure(original: Exception) -> ExtractionResult:
+    """Return a low-confidence result when Gemini rate-limited us to exhaustion.
+
+    This converts what would otherwise be a 502 to the client into a
+    successful (HTTP 200) response with ``confidence == "low"`` and a
+    clear note. The brief explicitly asks for this graceful degradation
+    so callers don't see hard failures during Gemini free-tier quota
+    incidents.
+    """
+    notes = (
+        "Vision service rate limit exceeded (Gemini quota / 429 / 503). "
+        "All retries exhausted; returning empty result. "
+        "Retry the request after a short pause. "
+        "retry_attempted=true; "
+        f"upstream_error={type(original).__name__}"
+    )
+    return ExtractionResult(
+        pay=None,
+        currency="unknown",
+        miles=None,
+        minutes=None,
+        orders=None,
+        platform="unknown",
+        confidence="low",
+        notes=notes,
+        raw_text="",
+    )
+
+
+def _annotate_retry_state(result: ExtractionResult, retried: bool) -> ExtractionResult:
+    """Append ``retry_attempted=true|false`` to the result's ``notes``.
+
+    Gives the client (and ops) visibility into whether the upstream call
+    bounced before succeeding. Lives in ``notes`` rather than a new field
+    so the public ``ExtractionResult`` schema stays stable — every
+    existing consumer keeps working, and the marker is greppable.
+    """
+    marker = f"retry_attempted={'true' if retried else 'false'}"
+    new_notes = (result.notes + " " + marker).strip() if result.notes else marker
+    return result.model_copy(update={"notes": new_notes})
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -823,7 +977,10 @@ def extract_from_image(
     Raises:
         RuntimeError: when the Gemini API key is missing.
         GoogleAPIError: when the Gemini API call fails irrecoverably (after
-            exhausting retries on transient errors).
+            exhausting fast-class retries on non-rate-limit transient
+            errors). Rate-limit exhaustion is converted to a low-confidence
+            ``ExtractionResult`` instead of raising — see
+            ``_rate_limited_failure``.
     """
     quality = detect_image_quality(image_bytes)
     mime_type = _detect_mime_type(image_bytes)
@@ -832,12 +989,24 @@ def extract_from_image(
     parse_errors: list[str] = []
     raw_response: str = ""
     parsed: dict[str, Any] | None = None
+    total_attempts = 0  # across both extraction passes
 
     # --- First attempt: master/Deliveroo prompt, with backoff retries ----
-    raw_response = _with_api_retries(
-        "extract",
-        lambda: _call_vision_model(prompt, image_bytes, mime_type),
-    )
+    try:
+        raw_response, attempts = _with_api_retries_tracked(
+            "extract",
+            lambda: _call_vision_model(prompt, image_bytes, mime_type),
+        )
+        total_attempts += attempts
+    except _RateLimitExhausted as exc:
+        logger.error(
+            "Rate-limit retries exhausted on initial extract; "
+            "returning low-confidence result instead of raising 502."
+        )
+        return _annotate_retry_state(
+            _rate_limited_failure(exc.original), retried=True
+        )
+
     try:
         parsed = _parse_json_response(raw_response)
     except ValueError as exc:
@@ -849,9 +1018,18 @@ def extract_from_image(
     # --- Retry attempt: stricter prompt, with backoff retries ----
     if parsed is None:
         try:
-            raw_response = _with_api_retries(
+            raw_response, attempts = _with_api_retries_tracked(
                 "extract-retry",
                 lambda: _call_vision_model(RETRY_STRICT_PROMPT, image_bytes, mime_type),
+            )
+            total_attempts += attempts
+        except _RateLimitExhausted as exc:
+            logger.error(
+                "Rate-limit retries exhausted on strict-prompt retry; "
+                "returning low-confidence result instead of raising 502."
+            )
+            return _annotate_retry_state(
+                _rate_limited_failure(exc.original), retried=True
             )
         except GoogleAPIError as exc:
             logger.exception("Gemini API error during strict-prompt retry: %s", exc)
@@ -865,7 +1043,10 @@ def extract_from_image(
                 "Retry JSON parse also failed (%s); returning low-confidence result.",
                 exc,
             )
-            return _low_confidence_failure(raw_response, parse_errors)
+            return _annotate_retry_state(
+                _low_confidence_failure(raw_response, parse_errors),
+                retried=True,
+            )
 
     # Post-parse normalization: rewrite string/nested-object numeric fields
     # before the Pydantic coercion happens. Logged corrections give us
@@ -891,4 +1072,8 @@ def extract_from_image(
             }
         )
 
-    return result
+    # ``total_attempts > 1`` means at least one retry happened across the
+    # whole pipeline — either the upstream bounced (rate-limit or transient
+    # 500) or the first response was unparseable and the strict-prompt
+    # second pass succeeded. Both are useful signal for the client.
+    return _annotate_retry_state(result, retried=total_attempts > 1)
