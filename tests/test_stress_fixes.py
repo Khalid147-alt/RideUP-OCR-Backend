@@ -7,7 +7,9 @@ permanent fixes:
 2. Uber Eats single order: ``"Delivery"`` (no number) ↔ orders == 1.
 3. raw_text contamination: model echoing its own JSON into ``raw_text``.
 4. Confidence scoring: don't penalise Deliveroo V2 for null miles/minutes.
-5. Routing: ``hint="deliveroo"`` must reach the V2 prompt.
+5. Routing: the Deliveroo V2 prompt must be reachable via the image-driven
+   colour-signature path (the hint parameter has since been removed from
+   the public API; routing is auto-detect only).
 
 Each test below corresponds to one of the eight items in the brief. The
 Gemini call is mocked throughout — these are unit tests for the
@@ -98,9 +100,7 @@ async def test_deliveroo_v2_three_orders(
         extractor, "_call_vision_model", return_value=json.dumps(payload)
     ):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post(
-            "/extract", files=files, data={"hint": "deliveroo"}
-        )
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -129,9 +129,7 @@ async def test_deliveroo_v2_one_order(
         extractor, "_call_vision_model", return_value=json.dumps(payload)
     ):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post(
-            "/extract", files=files, data={"hint": "deliveroo"}
-        )
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -160,9 +158,7 @@ async def test_deliveroo_v2_two_orders(
         extractor, "_call_vision_model", return_value=json.dumps(payload)
     ):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post(
-            "/extract", files=files, data={"hint": "deliveroo"}
-        )
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -201,9 +197,7 @@ async def test_uber_single_order(
         extractor, "_call_vision_model", return_value=json.dumps(payload)
     ):
         files = {"image": ("uber.png", good_png, "image/png")}
-        response = await client.post(
-            "/extract", files=files, data={"hint": "uber_eats"}
-        )
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -241,9 +235,7 @@ async def test_raw_text_json_contamination(
         extractor, "_call_vision_model", return_value=json.dumps(payload)
     ):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post(
-            "/extract", files=files, data={"hint": "deliveroo"}
-        )
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -314,16 +306,18 @@ def test_deliveroo_confidence_without_distance() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Routing: hint="deliveroo" reaches the V2 prompt
+# 8. Routing: Deliveroo V2 reachable from image content
 # ---------------------------------------------------------------------------
 
 
-def test_hint_deliveroo_routes_to_v2_prompt() -> None:
-    """The ``deliveroo`` hint reaches the V2 prompt regardless of image."""
-    # Black image — no teal signature. Routing should be hint-driven.
-    black = _make_png()  # random RGB noise, no teal dominance
-    chosen = extractor._select_prompt(black, hint="deliveroo")
-    assert chosen == prompts.DELIVEROO_V2_EXTRACTION_PROMPT
+def test_deliveroo_v2_prompt_still_reachable_from_build_helper() -> None:
+    """``build_extraction_prompt("deliveroo")`` returns the V2 prompt.
 
-    # build_extraction_prompt with the same hint returns the same prompt.
+    The caller hint was removed from the public HTTP API, but the internal
+    ``build_extraction_prompt`` helper still keys prompt selection by the
+    same string. ``_select_prompt`` uses it whenever the teal colour
+    signature triggers — V2 is the routing target for any Deliveroo-looking
+    image. This test locks in that contract so a future rename of the
+    Deliveroo key doesn't silently flip routing back to V1.
+    """
     assert prompts.build_extraction_prompt("deliveroo") == prompts.DELIVEROO_V2_EXTRACTION_PROMPT

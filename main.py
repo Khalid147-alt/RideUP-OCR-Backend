@@ -6,9 +6,8 @@ import base64
 import binascii
 import logging
 import time
-from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google.api_core.exceptions import GoogleAPIError
@@ -167,10 +166,10 @@ def _validate_size(num_bytes: int) -> None:
         )
 
 
-def _run_extraction(image_bytes: bytes, hint: Optional[str]) -> ExtractionResult:
+def _run_extraction(image_bytes: bytes) -> ExtractionResult:
     """Invoke the extractor, mapping known errors to safe HTTP responses."""
     try:
-        return extract_from_image(image_bytes, hint=hint)
+        return extract_from_image(image_bytes)
     except RuntimeError as exc:
         # Missing API key etc. — server misconfiguration.
         logger.error("Server misconfiguration: %s", exc)
@@ -237,22 +236,27 @@ async def health() -> HealthResponse:
 )
 async def extract(
     image: UploadFile = File(..., description="JPG/PNG/WEBP image, max 10 MB."),
-    hint: Optional[str] = Form(default=None, description="Optional platform hint."),
 ) -> JSONResponse:
-    """Extract structured data from a delivery-app screenshot upload."""
+    """Extract structured data from a delivery-app screenshot upload.
+
+    Platform is auto-detected from the image — there is no ``hint`` field.
+    Earlier revisions exposed a caller-supplied hint, but it caused real
+    pain in Swagger UI (the literal string "string" being passed through
+    as a hint) and added no signal the model couldn't recover from the
+    image colour signature + its own visual classification.
+    """
     _validate_upload(image)
     image_bytes = await image.read()
     _validate_size(len(image_bytes))
 
     logger.info(
-        "extract upload filename=%s content_type=%s bytes=%d hint=%s",
+        "extract upload filename=%s content_type=%s bytes=%d",
         image.filename,
         image.content_type,
         len(image_bytes),
-        hint or "-",
     )
 
-    result = _run_extraction(image_bytes, hint)
+    result = _run_extraction(image_bytes)
     return JSONResponse(
         content=result.model_dump(),
         headers={"X-Confidence": result.confidence},
@@ -271,7 +275,12 @@ async def extract(
     tags=["extraction"],
 )
 async def extract_base64(payload: Base64ImageRequest) -> JSONResponse:
-    """Extract structured data from a base64-encoded image payload."""
+    """Extract structured data from a base64-encoded image payload.
+
+    Like ``/extract``, platform is auto-detected — there is no ``hint``
+    field. Older clients that still send ``hint`` in the JSON body will
+    have the field silently ignored (Pydantic's ``extra="ignore"``).
+    """
     try:
         image_bytes = base64.b64decode(payload.image, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -282,13 +291,9 @@ async def extract_base64(payload: Base64ImageRequest) -> JSONResponse:
 
     _validate_size(len(image_bytes))
 
-    logger.info(
-        "extract/base64 bytes=%d hint=%s",
-        len(image_bytes),
-        payload.hint or "-",
-    )
+    logger.info("extract/base64 bytes=%d", len(image_bytes))
 
-    result = _run_extraction(image_bytes, payload.hint)
+    result = _run_extraction(image_bytes)
     return JSONResponse(
         content=result.model_dump(),
         headers={"X-Confidence": result.confidence},

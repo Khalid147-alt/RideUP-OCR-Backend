@@ -55,34 +55,21 @@ def _black_png(width: int = 600, height: int = 600) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def test_deliveroo_hint_routes_to_deliveroo_prompt() -> None:
-    """An explicit ``deliveroo`` hint always selects a Deliveroo prompt.
-
-    Post-V2 cutover this is the V2 prompt — V2 is now the default Deliveroo
-    template because the V2 layout is what the client stress test exposed as
-    the primary failure mode.
-    """
-    chosen = _select_prompt(_black_png(), hint="deliveroo")
-    assert chosen == prompts.DELIVEROO_V2_EXTRACTION_PROMPT
-
-
 def test_teal_image_routes_to_deliveroo_prompt() -> None:
-    """A teal-dominated image triggers the Deliveroo V2 prompt automatically."""
-    chosen = _select_prompt(_teal_png(), hint=None)
+    """A teal-dominated image triggers the Deliveroo V2 prompt automatically.
+
+    Routing is now image-driven only — the hint parameter was removed from
+    the public API. Teal pixel ratio crossing the threshold is the sole
+    signal that picks V2 over the master prompt.
+    """
+    chosen = _select_prompt(_teal_png())
     assert chosen == prompts.DELIVEROO_V2_EXTRACTION_PROMPT
 
 
 def test_non_teal_image_uses_master_prompt() -> None:
-    """A non-teal image with no hint falls through to the master prompt."""
-    chosen = _select_prompt(_black_png(), hint=None)
+    """A non-teal image falls through to the master prompt."""
+    chosen = _select_prompt(_black_png())
     assert chosen == prompts.MASTER_EXTRACTION_PROMPT
-
-
-def test_uber_hint_does_not_use_deliveroo_prompt() -> None:
-    """A non-Deliveroo hint preserves the master prompt with the hint appended."""
-    chosen = _select_prompt(_black_png(), hint="uber_eats")
-    assert chosen != prompts.DELIVEROO_EXTRACTION_PROMPT
-    assert "uber_eats" in chosen.lower()
 
 
 def test_looks_like_deliveroo_positive() -> None:

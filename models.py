@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Platform = Literal[
     "uber_eats",
@@ -21,7 +21,15 @@ Confidence = Literal["high", "medium", "low"]
 
 
 class Base64ImageRequest(BaseModel):
-    """JSON payload for the ``/extract/base64`` endpoint."""
+    """JSON payload for the ``/extract/base64`` endpoint.
+
+    The ``hint`` field that previous revisions accepted has been removed;
+    platform is auto-detected from the image. Older clients that still
+    send ``hint`` will not break — ``extra="ignore"`` drops the field
+    silently rather than raising a 422.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     image: str = Field(
         ...,
@@ -30,11 +38,6 @@ class Base64ImageRequest(BaseModel):
             "``data:image/...;base64,`` prefix — it will be stripped."
         ),
         min_length=16,
-    )
-    hint: Optional[str] = Field(
-        default=None,
-        description="Optional caller hint, e.g. 'uber_eats' or 'deliveroo'.",
-        max_length=64,
     )
 
     @field_validator("image")

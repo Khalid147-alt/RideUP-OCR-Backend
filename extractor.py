@@ -774,33 +774,29 @@ def _call_vision_model(
 # ---------------------------------------------------------------------------
 
 
-def _select_prompt(image_bytes: bytes, hint: str | None) -> str:
-    """Choose the best prompt variant for this image.
+def _select_prompt(image_bytes: bytes) -> str:
+    """Choose the best prompt variant for this image — auto-detect only.
 
-    Routing priority (mirrors the brief from the client stress test):
+    Routing priority (caller hints were removed from the public API; routing
+    is now driven entirely by the image itself plus the model's own
+    self-classification):
 
-    1. An explicit ``deliveroo`` hint always wins — the caller knows best
-       and the Deliveroo V2 prompt is now the default for that hint.
-    2. If the image looks like Deliveroo by colour signature (teal pixel
-       ratio above the threshold), use the Deliveroo V2 prompt.
-    3. Otherwise, use the master prompt (optionally augmented with the hint).
+    1. If the image looks like Deliveroo by colour signature (teal pixel
+       ratio above ``_TEAL_RATIO_THRESHOLD``), use the Deliveroo V2 prompt.
+    2. Otherwise, use the master prompt — it handles all five platforms
+       and self-detects which one based on UI cues.
 
-    Detection 2 originally included "Accept and go" text matching and
-    suitcase-icon detection, but both require OCR — which is exactly what
-    Gemini does in step 4 of the pipeline. They are folded into the
-    Deliveroo V2 prompt itself: once teal triggers routing, the prompt
-    handles V2 layout detection by content.
+    The Deliveroo V2 prompt is the routing target whenever teal dominates
+    because the V2 layout (no distance, no time, "Accept and go" button)
+    is what the client stress test exposed as the primary failure mode for
+    the master prompt. The V2 prompt internally reasons about V2-specific
+    fingerprints once routing has put us in the Deliveroo bucket.
     """
-    hint_clean = (hint or "").strip().lower()
-    if hint_clean == "deliveroo":
-        logger.info("Routing to Deliveroo V2 prompt (explicit hint).")
-        return build_extraction_prompt("deliveroo")
-
     if _looks_like_deliveroo(image_bytes):
         logger.info("Routing to Deliveroo V2 prompt (teal colour signature detected).")
         return build_extraction_prompt("deliveroo")
 
-    return build_extraction_prompt(hint_clean or None)
+    return build_extraction_prompt(None)
 
 
 def _looks_like_deliveroo(image_bytes: bytes) -> bool:
@@ -949,17 +945,16 @@ def _annotate_retry_state(result: ExtractionResult, retried: bool) -> Extraction
 # ---------------------------------------------------------------------------
 
 
-def extract_from_image(
-    image_bytes: bytes,
-    hint: str | None = None,
-) -> ExtractionResult:
+def extract_from_image(image_bytes: bytes) -> ExtractionResult:
     """Run the full extraction pipeline against the given image bytes.
 
     The pipeline:
 
     1. Detects image quality. Poor-quality images still go to the model but
        the result is flagged in ``notes`` and confidence is capped at "low".
-    2. Selects the best prompt variant (master vs Deliveroo-specific).
+    2. Selects the best prompt variant by auto-detecting the layout from
+       the image's colour signature (master vs Deliveroo V2). Caller
+       hints were removed from the public API.
     3. Calls Gemini Vision with exponential backoff retries on 429/502/503.
     4. Sanitizes the response and parses it as JSON. On failure, retries
        once with a stricter prompt (also with backoff).
@@ -969,7 +964,6 @@ def extract_from_image(
     Args:
         image_bytes: Raw image bytes (already validated for size/type by the
             HTTP layer).
-        hint: Optional platform hint from the caller.
 
     Returns:
         A fully-populated ``ExtractionResult``.
@@ -984,7 +978,7 @@ def extract_from_image(
     """
     quality = detect_image_quality(image_bytes)
     mime_type = _detect_mime_type(image_bytes)
-    prompt = _select_prompt(image_bytes, hint)
+    prompt = _select_prompt(image_bytes)
 
     parse_errors: list[str] = []
     raw_response: str = ""

@@ -190,12 +190,32 @@ async def test_base64_endpoint(
     """``POST /extract/base64`` accepts a base64 payload and returns a result."""
     response = await client.post(
         "/extract/base64",
-        json={"image": good_png_b64, "hint": "uber_eats"},
+        json={"image": good_png_b64},
     )
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["platform"] == "uber_eats"
     assert body["confidence"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_base64_endpoint_ignores_legacy_hint_field(
+    client: AsyncClient,
+    good_png_b64: str,
+    patched_vision,
+) -> None:
+    """Older clients that still send ``hint`` get a 200, not a 422.
+
+    The ``hint`` field was removed from the request model in this revision,
+    but Pydantic's ``extra="ignore"`` silently drops unknown keys so the
+    Base44 frontend (and any other in-flight integrations) keep working
+    while they migrate.
+    """
+    response = await client.post(
+        "/extract/base64",
+        json={"image": good_png_b64, "hint": "uber_eats"},
+    )
+    assert response.status_code == 200, response.text
 
 
 @pytest.mark.asyncio
@@ -328,7 +348,7 @@ async def test_deliveroo_pay_as_string_with_currency_symbol(
     payload = _deliveroo_payload(pay="£6.50")
     with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -346,7 +366,7 @@ async def test_deliveroo_miles_with_unit_suffix(
     payload = _deliveroo_payload(miles="2.1 mi")
     with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -363,7 +383,7 @@ async def test_deliveroo_minutes_with_unit_suffix(
     payload = _deliveroo_payload(minutes="18 min")
     with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -380,7 +400,7 @@ async def test_deliveroo_nested_pay_object(
     payload = _deliveroo_payload(pay={"gross": 6.50, "tip": 1.00})
     with patch.object(extractor, "_call_vision_model", return_value=json.dumps(payload)):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -399,7 +419,7 @@ async def test_deliveroo_markdown_wrapped_response(
     wrapped = f"Sure! Here's the data:\n\n```json\n{inner}\n```\n\nLet me know if you need more."
     with patch.object(extractor, "_call_vision_model", return_value=wrapped):
         files = {"image": ("deliveroo.png", good_png, "image/png")}
-        response = await client.post("/extract", files=files, data={"hint": "deliveroo"})
+        response = await client.post("/extract", files=files)
 
     assert response.status_code == 200, response.text
     body = response.json()
