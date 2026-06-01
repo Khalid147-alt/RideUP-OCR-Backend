@@ -26,3 +26,6 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+# Node (for Base44 integration files used downstream)
+node_modules/

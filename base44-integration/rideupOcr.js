@@ -1,130 +1,113 @@
 /**
- * RideUP OCR client — minimal wrapper around the backend.
+ * RideUp OCR — Base44 client.
  *
- * Drop this in your Base44 project at: src/lib/rideupOcr.js
+ * Lightweight wrapper around the RideUp OCR Backend. No API keys required —
+ * the backend handles Gemini auth server-side. Just import and call.
  *
- * Usage:
- *   import { extractFromFile, extractFromBase64, checkHealth } from "./lib/rideupOcr";
+ * Drop this in your Base44 project (e.g. src/lib/rideupOcr.js) and import:
  *
- *   const result = await extractFromFile(file);
- *   if (result.confidence === "low") { ... }
+ *   import { extractOcrData, extractOcrDataBase64 } from "./lib/rideupOcr";
+ *
+ *   const result = await extractOcrData(file);
+ *   // result = { pay, currency, miles, minutes, orders, platform, confidence, notes, raw_text }
  */
 
-// Configure your backend URL via env. Examples:
-//   Vite:        import.meta.env.VITE_RIDEUP_OCR_URL
-//   CRA / Next:  process.env.NEXT_PUBLIC_RIDEUP_OCR_URL
-//   Or hardcode the HuggingFace URL below as a fallback.
-const BACKEND_URL =
-  (typeof import.meta !== "undefined" &&
-    import.meta.env &&
-    (import.meta.env.VITE_RIDEUP_OCR_URL ||
-      import.meta.env.RIDEUP_OCR_URL)) ||
-  (typeof process !== "undefined" &&
-    process.env &&
-    process.env.NEXT_PUBLIC_RIDEUP_OCR_URL) ||
-  "https://YOUR-USERNAME-rideup-ocr-backend.hf.space";
-
-class OcrError extends Error {
-  constructor(message, { status, detail } = {}) {
-    super(message);
-    this.name = "OcrError";
-    this.status = status;
-    this.detail = detail;
-  }
-}
-
-async function _parseError(res) {
-  let body = {};
-  try {
-    body = await res.json();
-  } catch {
-    /* ignore */
-  }
-  return new OcrError(body.detail || `Extraction failed (${res.status})`, {
-    status: res.status,
-    detail: body.detail,
-  });
-}
-
-/**
- * Extract from a File / Blob (typical file-picker or camera capture).
- * @param {File|Blob} file
- * @param {string} [hint] - Optional platform hint, e.g. "uber_eats".
- * @returns {Promise<ExtractionResult>}
- */
-export async function extractFromFile(file, hint) {
-  if (!file) throw new OcrError("No file provided");
-  const form = new FormData();
-  form.append("image", file);
-  if (hint) form.append("hint", hint);
-
-  const res = await fetch(`${BACKEND_URL}/extract`, {
-    method: "POST",
-    body: form,
-  });
-  if (!res.ok) throw await _parseError(res);
-  return res.json();
-}
-
-/**
- * Extract from a base64 string (mobile / canvas-captured / pasted data URL).
- * Accepts both bare base64 and "data:image/png;base64,..." URLs.
- * @param {string} base64
- * @param {string} [hint]
- * @returns {Promise<ExtractionResult>}
- */
-export async function extractFromBase64(base64, hint) {
-  if (!base64) throw new OcrError("No image data provided");
-  const res = await fetch(`${BACKEND_URL}/extract/base64`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ image: base64, hint }),
-  });
-  if (!res.ok) throw await _parseError(res);
-  return res.json();
-}
-
-/**
- * Liveness probe.
- * @returns {Promise<{status: string, model: string, version: string}>}
- */
-export async function checkHealth() {
-  const res = await fetch(`${BACKEND_URL}/health`);
-  if (!res.ok) throw new OcrError("Health check failed", { status: res.status });
-  return res.json();
-}
-
-/**
- * Format an ExtractionResult for UI display, handling null fields cleanly.
- * @param {ExtractionResult} result
- */
-export function formatForDisplay(result) {
-  const dash = "—";
-  return {
-    pay:
-      result.pay != null
-        ? `${result.currency === "GBP" ? "£" : result.currency === "USD" ? "$" : result.currency === "EUR" ? "€" : ""}${result.pay.toFixed(2)}`
-        : dash,
-    miles: result.miles != null ? `${result.miles} mi` : dash,
-    minutes: result.minutes != null ? `${result.minutes} min` : dash,
-    orders: result.orders != null ? String(result.orders) : dash,
-    platform: result.platform.replace(/_/g, " "),
-    confidence: result.confidence,
-    notes: result.notes || "",
-  };
-}
-
-export { OcrError };
+const RIDEUP_OCR_URL = "https://khalid147-rideup-ocr-backend.hf.space";
 
 /**
  * @typedef {Object} ExtractionResult
- * @property {number|null} pay
+ * @property {number|null} pay        Trip earnings (e.g. 11.08). Null if unreadable.
  * @property {"GBP"|"USD"|"EUR"|"unknown"} currency
- * @property {number|null} miles
- * @property {number|null} minutes
- * @property {number|null} orders
- * @property {"uber_eats"|"deliveroo"|"stuart"|"just_eat"|"rideup"|"unknown"} platform
+ * @property {number|null} miles      Distance in miles. Null for Deliveroo V2 (expected).
+ * @property {number|null} minutes    Duration in minutes. Null for Deliveroo V2 (expected).
+ * @property {number|null} orders     Number of orders / stops.
+ * @property {"uber_eats"|"deliveroo"|"unknown"} platform
  * @property {"high"|"medium"|"low"} confidence
- * @property {string} notes
- * @property {string} raw_text
+ * @property {string} notes           Layout detected, edge cases, retry markers.
+ * @property {string} raw_text        Raw OCR text — useful for debugging.
  */
+
+/**
+ * Extract structured trip data from an image File / Blob.
+ *
+ * Posts the image as multipart/form-data to `POST /extract`.
+ *
+ * @param {File|Blob} imageFile  An image File from an `<input type="file">`
+ *                               or a Blob from a canvas / camera capture.
+ *                               Must be JPG, PNG, or WEBP, under 10 MB.
+ * @returns {Promise<ExtractionResult>} Structured trip data.
+ * @throws {Error} If the request fails or the backend returns a non-2xx status.
+ */
+export async function extractOcrData(imageFile) {
+  if (!imageFile) {
+    throw new Error("extractOcrData: no image file provided");
+  }
+
+  const formData = new FormData();
+  formData.append("image", imageFile);
+
+  try {
+    const response = await fetch(`${RIDEUP_OCR_URL}/extract`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      let detail = `OCR request failed (${response.status})`;
+      try {
+        const errBody = await response.json();
+        if (errBody?.detail) detail = errBody.detail;
+      } catch {
+        /* response body was not JSON — keep generic detail */
+      }
+      throw new Error(detail);
+    }
+
+    return await response.json();
+  } catch (err) {
+    // Re-throw with a stable message so the caller can show it to the user.
+    if (err instanceof Error) throw err;
+    throw new Error("OCR request failed: unknown error");
+  }
+}
+
+/**
+ * Extract structured trip data from a base64-encoded image string.
+ *
+ * Posts JSON to `POST /extract/base64`. Accepts either a bare base64 string
+ * or a full data URL (e.g. "data:image/png;base64,iVBORw0K..."); the backend
+ * strips the prefix automatically.
+ *
+ * @param {string} base64String  Base64 image data, with or without a data: prefix.
+ * @returns {Promise<ExtractionResult>} Structured trip data.
+ * @throws {Error} If the request fails or the backend returns a non-2xx status.
+ */
+export async function extractOcrDataBase64(base64String) {
+  if (!base64String) {
+    throw new Error("extractOcrDataBase64: no image data provided");
+  }
+
+  try {
+    const response = await fetch(`${RIDEUP_OCR_URL}/extract/base64`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: base64String }),
+    });
+
+    if (!response.ok) {
+      let detail = `OCR request failed (${response.status})`;
+      try {
+        const errBody = await response.json();
+        if (errBody?.detail) detail = errBody.detail;
+      } catch {
+        /* response body was not JSON — keep generic detail */
+      }
+      throw new Error(detail);
+    }
+
+    return await response.json();
+  } catch (err) {
+    if (err instanceof Error) throw err;
+    throw new Error("OCR request failed: unknown error");
+  }
+}
