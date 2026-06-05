@@ -76,6 +76,22 @@ class ExtractionResult(BaseModel):
         default="low",
         description="Overall confidence in the extraction.",
     )
+    pickup_postcode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pickup postcode parsed from raw_text (Deliveroo V2 only). "
+            "Populated whenever a postcode is detected, even if mileage "
+            "estimation fails."
+        ),
+    )
+    dropoff_postcode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Drop-off postcode parsed from raw_text (Deliveroo V2 only). "
+            "Populated whenever a second postcode is detected, even if "
+            "mileage estimation fails."
+        ),
+    )
     notes: str = Field(
         default="",
         description="Free-text notes about edge cases or ambiguities.",

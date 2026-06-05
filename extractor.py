@@ -20,6 +20,7 @@ Resilience:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -43,6 +44,11 @@ from PIL import Image, UnidentifiedImageError
 from config import settings
 from models import ExtractionResult
 from prompts import RETRY_STRICT_PROMPT, build_extraction_prompt
+from utils.postcode_utils import (
+    calculate_distance_miles,
+    extract_postcodes,
+    get_postcode_coordinates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1071,3 +1077,146 @@ def extract_from_image(image_bytes: bytes) -> ExtractionResult:
     # 500) or the first response was unparseable and the strict-prompt
     # second pass succeeded. Both are useful signal for the client.
     return _annotate_retry_state(result, retried=total_attempts > 1)
+
+
+# ---------------------------------------------------------------------------
+# Deliveroo V2 postcode-based mileage estimation
+# ---------------------------------------------------------------------------
+#
+# Deliveroo's "Accept and go" offer cards never show distance to the driver,
+# so ``miles`` comes back null for a correct read. The card *does* print the
+# pickup and drop-off addresses, including postcodes, in ``raw_text``. We
+# recover those, geocode them via postcodes.io, and estimate the straight-line
+# distance. This is a best-effort enrichment layered on *after* the Gemini
+# pipeline — it never blocks or fails the core extraction.
+
+# Total wall-clock budget for the whole estimation (two geocode calls +
+# distance). The brief mandates a 5-second ceiling: if postcodes.io is slow,
+# we abandon the estimate rather than hold the client request open.
+_MILEAGE_ESTIMATE_TIMEOUT_SECONDS = 5.0
+
+
+async def estimate_deliveroo_mileage(raw_text: str) -> tuple[float | None, str]:
+    """Estimate Deliveroo V2 mileage from postcodes embedded in ``raw_text``.
+
+    Pipeline:
+
+    1. Extract pickup + drop-off postcodes from ``raw_text``.
+    2. Geocode both via postcodes.io (concurrently).
+    3. Compute the Haversine distance between them.
+
+    The whole operation is bounded by a 5-second total timeout. Any failure —
+    fewer than two postcodes, a geocode miss, an API outage, or the timeout —
+    returns ``(None, "")`` so the caller leaves ``miles`` untouched and adds
+    no note. The feature is invisible when it can't help.
+
+    Args:
+        raw_text: The OCR text from a Deliveroo V2 screenshot.
+
+    Returns:
+        ``(estimated_miles, estimation_note)`` on success, or ``(None, "")``
+        if estimation was not possible for any reason. ``estimation_note`` is
+        ready to append to the result's ``notes`` field.
+    """
+    pickup, dropoff = extract_postcodes(raw_text)
+    if not pickup or not dropoff:
+        # Need *both* endpoints to compute a distance.
+        return None, ""
+
+    try:
+        pickup_coords, dropoff_coords = await asyncio.wait_for(
+            asyncio.gather(
+                get_postcode_coordinates(pickup),
+                get_postcode_coordinates(dropoff),
+            ),
+            timeout=_MILEAGE_ESTIMATE_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        # Fail silently — postcodes.io slow/unreachable, or any unexpected
+        # error. The core extraction result is unaffected.
+        logger.info("Deliveroo mileage estimate skipped: %s", exc)
+        return None, ""
+
+    if pickup_coords is None or dropoff_coords is None:
+        # One or both postcodes did not geocode.
+        return None, ""
+
+    miles = calculate_distance_miles(
+        pickup_coords[0], pickup_coords[1], dropoff_coords[0], dropoff_coords[1]
+    )
+    note = (
+        f"Miles estimated from postcodes {pickup} → {dropoff} "
+        "via postcodes.io"
+    )
+    return miles, note
+
+
+async def enrich_deliveroo_postcodes(result: ExtractionResult) -> ExtractionResult:
+    """Augment a Deliveroo V2 result with postcodes and estimated mileage.
+
+    This is the integration seam between the synchronous Gemini pipeline
+    (``extract_from_image``) and the async postcode-geocoding layer. The HTTP
+    endpoints call it after extraction; it returns a *new* ``ExtractionResult``
+    (the input is never mutated) and never raises.
+
+    Behaviour:
+
+    - ``pickup_postcode`` / ``dropoff_postcode`` are populated whenever they
+      can be parsed from ``raw_text`` — independently of whether geocoding or
+      distance estimation succeeds.
+    - Mileage estimation runs **only** when *all* of these hold:
+        * ``platform == "deliveroo"``
+        * ``miles is None``
+        * ``raw_text`` is non-empty
+        * two postcodes were found
+    - On a successful estimate: ``miles`` is set, and the estimation note is
+      appended to ``notes``. Confidence is left untouched.
+    - On any failure (single postcode, geocode miss, API down, timeout):
+      ``miles`` stays ``None`` and ``notes`` is unchanged.
+
+    Args:
+        result: The ``ExtractionResult`` from ``extract_from_image``.
+
+    Returns:
+        A possibly-enriched copy of ``result`` (or the original unchanged when
+        the gating conditions are not met).
+    """
+    # Gate 1: only Deliveroo screenshots with no native miles and some text.
+    if (
+        result.platform != "deliveroo"
+        or result.miles is not None
+        or not result.raw_text
+    ):
+        return result
+
+    try:
+        pickup, dropoff = extract_postcodes(result.raw_text)
+    except Exception as exc:  # noqa: BLE001 — enrichment must never raise.
+        logger.info("Postcode extraction failed during enrichment: %s", exc)
+        return result
+
+    updates: dict[str, Any] = {}
+    if pickup is not None:
+        updates["pickup_postcode"] = pickup
+    if dropoff is not None:
+        updates["dropoff_postcode"] = dropoff
+
+    # Only attempt the (networked) mileage estimate when both postcodes exist.
+    if pickup is not None and dropoff is not None:
+        try:
+            estimated_miles, note = await estimate_deliveroo_mileage(
+                result.raw_text
+            )
+        except Exception as exc:  # noqa: BLE001 — belt-and-braces.
+            logger.info("Mileage estimation failed during enrichment: %s", exc)
+            estimated_miles, note = None, ""
+
+        if estimated_miles is not None and note:
+            updates["miles"] = estimated_miles
+            updates["notes"] = (
+                (result.notes + " " + note).strip() if result.notes else note
+            )
+
+    if not updates:
+        return result
+    return result.model_copy(update=updates)

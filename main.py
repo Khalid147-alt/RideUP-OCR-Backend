@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from google.api_core.exceptions import GoogleAPIError
 
 from config import settings
-from extractor import extract_from_image
+from extractor import enrich_deliveroo_postcodes, extract_from_image
 from models import (
     Base64ImageRequest,
     ErrorResponse,
@@ -192,6 +192,21 @@ def _run_extraction(image_bytes: bytes) -> ExtractionResult:
         ) from exc
 
 
+async def _enrich_result(result: ExtractionResult) -> ExtractionResult:
+    """Apply Deliveroo V2 postcode/mileage enrichment, never failing the request.
+
+    Enrichment is a best-effort, value-add step (postcodes + estimated miles).
+    If anything goes wrong — a bug, an unexpected error — we log it and return
+    the original result untouched. The core extraction must never be lost to an
+    enrichment failure.
+    """
+    try:
+        return await enrich_deliveroo_postcodes(result)
+    except Exception as exc:  # pragma: no cover — defensive catch-all
+        logger.warning("Postcode enrichment failed; returning base result: %s", exc)
+        return result
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -257,6 +272,7 @@ async def extract(
     )
 
     result = _run_extraction(image_bytes)
+    result = await _enrich_result(result)
     return JSONResponse(
         content=result.model_dump(),
         headers={"X-Confidence": result.confidence},
@@ -294,6 +310,7 @@ async def extract_base64(payload: Base64ImageRequest) -> JSONResponse:
     logger.info("extract/base64 bytes=%d", len(image_bytes))
 
     result = _run_extraction(image_bytes)
+    result = await _enrich_result(result)
     return JSONResponse(
         content=result.model_dump(),
         headers={"X-Confidence": result.confidence},
