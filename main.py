@@ -7,6 +7,7 @@ import binascii
 import logging
 import time
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -64,6 +65,81 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Keepalive scheduler — prevents HuggingFace free-tier Spaces from sleeping
+# ---------------------------------------------------------------------------
+#
+# HuggingFace free Spaces are marked inactive after ~48h with no traffic, and
+# the next request then pays a 30-60s cold-start penalty (surfaced in the
+# RideUp frontend as "OCR server is waking up"). A lightweight self-ping every
+# 25 minutes keeps the Space warm.
+#
+# The whole scheduler is best-effort: the APScheduler import is guarded and
+# every startup/shutdown path is wrapped in try/except so a scheduler problem
+# can never stop the OCR API from booting or serving requests.
+
+# URL the keepalive job pings. The Space pings its own public health endpoint.
+_KEEPALIVE_URL = "https://khalid147-rideup-ocr-backend.hf.space/health"
+_KEEPALIVE_INTERVAL_MINUTES = 25
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    scheduler: "AsyncIOScheduler | None" = AsyncIOScheduler()
+except Exception as exc:  # pragma: no cover — defensive: missing/broken dep.
+    # The app must still start normally if APScheduler is unavailable.
+    scheduler = None
+    logger.warning("APScheduler unavailable; keepalive disabled: %s", exc)
+
+
+async def ping_self() -> None:
+    """Ping own health endpoint to prevent HuggingFace sleep.
+
+    Network failures are swallowed — a missed ping is harmless (the next one
+    is 25 minutes away) and must never surface as an error.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(_KEEPALIVE_URL)
+            logger.info("Keepalive ping: %s", response.status_code)
+    except Exception as exc:  # noqa: BLE001 — keepalive must never raise.
+        logger.warning("Keepalive ping failed: %s", exc)
+
+
+@app.on_event("startup")
+async def start_scheduler() -> None:
+    """Start the keepalive scheduler on app startup (best-effort)."""
+    if scheduler is None:
+        return
+    try:
+        scheduler.add_job(
+            ping_self,
+            trigger="interval",
+            minutes=_KEEPALIVE_INTERVAL_MINUTES,
+            id="keepalive",
+            replace_existing=True,
+        )
+        scheduler.start()
+        logger.info(
+            "Keepalive scheduler started — pinging every %d minutes",
+            _KEEPALIVE_INTERVAL_MINUTES,
+        )
+    except Exception as exc:  # pragma: no cover — never block app startup.
+        logger.warning("Keepalive scheduler failed to start: %s", exc)
+
+
+@app.on_event("shutdown")
+async def stop_scheduler() -> None:
+    """Stop the keepalive scheduler on app shutdown."""
+    if scheduler is None:
+        return
+    try:
+        scheduler.shutdown(wait=False)
+        logger.info("Keepalive scheduler stopped")
+    except Exception as exc:  # pragma: no cover — shutdown must not raise.
+        logger.warning("Keepalive scheduler failed to stop cleanly: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +301,7 @@ async def root() -> RootResponse:
         endpoints={
             "GET  /": "API metadata",
             "GET  /health": "Health check",
+            "GET  /keepalive/status": "Keepalive scheduler status",
             "POST /extract": "Extract from multipart image upload",
             "POST /extract/base64": "Extract from base64 JSON payload",
             "GET  /docs": "Interactive Swagger UI",
@@ -236,6 +313,25 @@ async def root() -> RootResponse:
 async def health() -> HealthResponse:
     """Liveness/health probe."""
     return HealthResponse(status="ok", model=settings.model_name, version=API_VERSION)
+
+
+@app.get("/keepalive/status", tags=["meta"])
+async def keepalive_status() -> dict:
+    """Report whether the keepalive scheduler is running and its jobs.
+
+    Returns ``scheduler_running: false`` with an empty ``jobs`` list when the
+    scheduler is unavailable (APScheduler missing or failed to start) rather
+    than erroring — the endpoint itself is always safe to call.
+    """
+    if scheduler is None:
+        return {"scheduler_running": False, "jobs": []}
+    return {
+        "scheduler_running": scheduler.running,
+        "jobs": [
+            {"id": job.id, "next_run": str(job.next_run_time)}
+            for job in scheduler.get_jobs()
+        ],
+    }
 
 
 @app.post(
