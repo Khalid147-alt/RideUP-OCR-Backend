@@ -309,7 +309,7 @@ async def root() -> RootResponse:
     )
 
 
-@app.get("/health", response_model=HealthResponse, tags=["meta"])
+@app.api_route("/health", methods=["GET", "HEAD"], response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
     """Liveness/health probe."""
     return HealthResponse(status="ok", model=settings.model_name, version=API_VERSION)
